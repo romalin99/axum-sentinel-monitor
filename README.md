@@ -57,21 +57,72 @@ async fn main() {
 Run the included example with `cargo run --example basic`, then open
 `http://127.0.0.1:3000/monitor`.
 
-The example also exposes two JSON endpoints for generating monitored traffic:
+`monitor.layer()` counts requests passing through that layer. Move the layer onto a
+sub-router if only part of the application should be counted. The monitor route itself is
+counted in the example because the layer wraps the complete application.
+
+## Example traffic endpoints
+
+The basic example exposes two JSON endpoints for generating monitored requests.
+
+### Search
+
+```http
+GET /search?name=Tom&age=18
+```
+
+Both query parameters are required. The response appends `你好` to `name` and increments
+`age` with saturating `u32` arithmetic:
+
+```json
+{
+  "name": "Tom你好",
+  "age": 19
+}
+```
+
+Test it with:
 
 ```sh
 curl 'http://127.0.0.1:3000/search?name=Tom&age=18'
+```
+
+### Create user
+
+```http
+POST /user
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+  "name": "Alice",
+  "age": 20
+}
+```
+
+Response:
+
+```json
+{
+  "id": 1,
+  "name": "Alice",
+  "age": 20
+}
+```
+
+`id` is a process-local incrementing `u64` and resets when the example restarts.
+
+```sh
 curl -X POST 'http://127.0.0.1:3000/user' \
   -H 'Content-Type: application/json' \
   -d '{"name":"Alice","age":20}'
 ```
 
-The first response is `{"name":"Tom你好","age":19}`. The second assigns a
-process-local incrementing `u64` ID and returns the submitted name and age.
-
-`monitor.layer()` counts requests passing through that layer. Move the layer onto a
-sub-router if only part of the application should be counted. The monitor route itself is
-counted in the example because the layer wraps the complete application.
+These requests increase the monitor's total/request-delta counters. The Response Time
+chart still measures the browser's polling request to `/monitor`, matching Fiber v3.
 
 ## Configuration
 
@@ -114,8 +165,9 @@ Send `Accept: application/json` to the mounted monitor URL:
 
 `requests` is a decimal string so JavaScript does not lose 64-bit integer precision.
 Response time is measured in the browser around the polling request, matching Fiber
-Monitor; it is not server handler latency. Request chart points are counts since the prior
-poll, not requests per second.
+Monitor; it is not server handler latency. The headline shows the raw latest value while
+the chart uses an EWMA (`alpha = 0.2`) to reduce browser scheduling jitter. Request chart
+points are counts since the prior poll, not requests per second.
 
 ## Security
 

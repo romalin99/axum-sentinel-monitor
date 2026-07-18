@@ -101,7 +101,7 @@ canvas{width:100%!important;height:100%!important}
 </section><section class="panels">
 <div class="panel" style="--accent:var(--cyan)"><div class="head"><span class="metric">CPU Usage</span><span class="big"><span id="cpuVal">0.0%</span><span class="sub" id="cpuSub">OS 0.0%</span></span></div><div class="canvas-wrap"><canvas id="cpu"></canvas></div></div>
 <div class="panel" style="--accent:var(--violet)"><div class="head"><span class="metric">Memory Usage</span><span class="big"><span id="memVal">0 B</span><span class="sub" id="memSub"></span></span></div><div class="canvas-wrap"><canvas id="memory"></canvas></div></div>
-<div class="panel" style="--accent:var(--amber)"><div class="head"><span class="metric">Response Time</span><span class="big"><span id="rtVal">0 ms</span><span class="sub">client</span></span></div><div class="canvas-wrap"><canvas id="latency"></canvas></div></div>
+<div class="panel" style="--accent:var(--amber)"><div class="head"><span class="metric">Response Time</span><span class="big"><span id="rtVal">0 ms</span><span class="sub" id="rtSub">client · EWMA 0.0 ms</span></span></div><div class="canvas-wrap"><canvas id="latency"></canvas></div></div>
 <div class="panel" style="--accent:var(--teal)"><div class="head"><span class="metric">Open Connections</span><span class="big"><span id="connVal">0</span><span class="sub" id="connSub">OS 0</span></span></div><div class="canvas-wrap"><canvas id="connections"></canvas></div></div>
 <div class="panel" style="--accent:var(--pink)"><div class="head"><span class="metric">Requests / sample</span><span class="big"><span id="rateVal">+0</span><span class="sub" id="rateSub">0 total</span></span></div><div class="canvas-wrap"><canvas id="requestRate"></canvas></div></div>
 <div class="panel" style="--accent:var(--indigo)"><div class="head"><span class="metric">Threads</span><span class="big"><span id="thVal">0</span><span class="sub">process tasks</span></span></div><div class="canvas-wrap"><canvas id="threadChart"></canvas></div></div>
@@ -111,6 +111,10 @@ canvas{width:100%!important;height:100%!important}
   const limit=Number("__HISTORY_POINTS__"),pollMs=Number("__POLL_MS__"),labels=[];
   const values={pcpu:[],ocpu:[],pram:[],oram:[],ototal:[],latency:[],pconns:[],oconns:[],rate:[],threads:[]};
   let previous=null;
+  // Keep the raw client latency in the headline, but chart an exponentially
+  // weighted moving average so browser scheduling jitter does not dominate.
+  const latencyAlpha=.2;
+  let latencyEwma=null;
   // Fiber v3 renders memory values with binary (1024-based) units.
   function formatBytes(bytes){
     bytes=Number(bytes)||0;if(bytes===0)return"0 B";
@@ -135,7 +139,7 @@ canvas{width:100%!important;height:100%!important}
   const charts=[
     chart("cpu",["Process","System"],["pcpu","ocpu"],["#38bdf8","#34d399"]),
     chart("memory",["Process","OS used","OS total"],["pram","oram","ototal"],["#a78bfa","#fbbf24","#34d399"]),
-    chart("latency",["Client ms"],["latency"],["#fbbf24"]),
+    chart("latency",["Client EWMA ms"],["latency"],["#fbbf24"]),
     chart("connections",["Process","System"],["pconns","oconns"],["#22d3ee","#34d399"]),
     chart("requestRate",["Requests"],["rate"],["#f472b6"]),
     chart("threadChart",["Threads"],["threads"],["#818cf8"])
@@ -160,12 +164,13 @@ canvas{width:100%!important;height:100%!important}
       const response=await fetch(location.href,{headers:{Accept:"application/json"},cache:"no-store"});
       if(!response.ok)throw new Error(`HTTP ${response.status}`);
       const data=await response.json(),rtime=Math.round(performance.now()-started);
+      latencyEwma=latencyEwma===null?rtime:latencyAlpha*rtime+(1-latencyAlpha)*latencyEwma;
       const requestText=String(data.pid.requests),requests=BigInt(requestText);
       const rate=requestDelta(requests);
       labels.push(Date.now());if(labels.length>limit)labels.shift();
       push(values.pcpu,data.pid.cpu);push(values.ocpu,data.os.cpu);
       push(values.pram,data.pid.ram/1e6);push(values.oram,data.os.ram/1e6);push(values.ototal,data.os.total_ram/1e6);
-      push(values.latency,rtime);push(values.pconns,data.pid.conns);push(values.oconns,data.os.conns);
+      push(values.latency,latencyEwma);push(values.pconns,data.pid.conns);push(values.oconns,data.os.conns);
       push(values.rate,rate);push(values.threads,data.pid.goroutines);previous=requests;
       setText("requests",requests.toLocaleString());
       setText("reqRate",`+${rate.toLocaleString()} since last sample`);
@@ -177,6 +182,7 @@ canvas{width:100%!important;height:100%!important}
       setText("memVal",formatBytes(data.pid.ram));
       document.getElementById("memSub").innerHTML=`/ <span style="color:var(--amber)">${formatBytes(data.os.ram)}</span> / <span style="color:var(--green)">${formatBytes(data.os.total_ram)}</span>`;
       setText("rtVal",`${rtime} ms`);
+      setText("rtSub",`client · EWMA ${latencyEwma.toFixed(1)} ms`);
       setText("connVal",Number(data.pid.conns).toLocaleString());
       setText("connSub",`OS ${Number(data.os.conns).toLocaleString()}`);
       setText("rateVal",`+${rate.toLocaleString()}`);

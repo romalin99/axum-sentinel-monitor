@@ -76,7 +76,7 @@ canvas{width:100%!important;height:215px!important}.fallback{color:var(--muted)}
 (() => {
   const limit=51,pollMs=Number("__POLL_MS__"),labels=[];
   const values={pcpu:[],ocpu:[],pram:[],oram:[],latency:[],pconns:[],oconns:[],rate:[],threads:[]};
-  let previous=0;
+  let previous=null;
   const options={responsive:true,maintainAspectRatio:false,animation:{duration:0},legend:{labels:{fontColor:"#9aa7c2"}},scales:{xAxes:[{display:false}],yAxes:[{ticks:{beginAtZero:true,fontColor:"#9aa7c2"},gridLines:{color:"#25314e"}}]}};
   function chart(id,names,keys){
     if(!window.Chart){const node=document.createElement("div");node.className="fallback";node.textContent="Chart.js is unavailable.";document.getElementById(id).replaceWith(node);return null}
@@ -94,13 +94,14 @@ canvas{width:100%!important;height:215px!important}.fallback{color:var(--muted)}
     try{
       const response=await fetch(location.href,{headers:{Accept:"application/json"},cache:"no-store"});
       if(!response.ok)throw new Error(`HTTP ${response.status}`);
-      const data=await response.json(),elapsed=performance.now()-started,requests=Number(data.pid.requests)||0;
+      const data=await response.json(),elapsed=performance.now()-started,requestText=String(data.pid.requests),requests=BigInt(requestText);
+      const difference=previous===null?0n:requests-previous,rate=Number(difference>BigInt(Number.MAX_SAFE_INTEGER)?BigInt(Number.MAX_SAFE_INTEGER):difference);
       labels.push(new Date().toLocaleTimeString());if(labels.length>limit)labels.shift();
       push(values.pcpu,data.pid.cpu);push(values.ocpu,data.os.cpu);push(values.pram,data.pid.ram/1048576);
       push(values.oram,data.os.total_ram?data.os.ram/data.os.total_ram*100:0);push(values.latency,elapsed);
-      push(values.pconns,data.pid.conns);push(values.oconns,data.os.conns);push(values.rate,Math.max(0,requests-previous));
+      push(values.pconns,data.pid.conns);push(values.oconns,data.os.conns);push(values.rate,Math.max(0,rate));
       push(values.threads,data.pid.goroutines);previous=requests;
-      document.getElementById("requests").textContent=data.pid.requests;document.getElementById("uptime").textContent=duration(data.pid.uptime);
+      document.getElementById("requests").textContent=requests.toLocaleString();document.getElementById("uptime").textContent=duration(data.pid.uptime);
       document.getElementById("threads").textContent=data.pid.goroutines;document.getElementById("load").textContent=Number(data.os.load_avg).toFixed(2);
       document.getElementById("status").textContent=`Updated ${new Date().toLocaleTimeString()}`;charts.forEach(item=>item.update())
     }catch(error){document.getElementById("status").textContent=`Unavailable: ${error.message}`}

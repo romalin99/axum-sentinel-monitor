@@ -2,7 +2,7 @@
 name = "axum-sentinel-monitor"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "An embeddable real-time system monitor for Axum"
 license = "MIT"
 repository = "https://github.com/romalin99/axum-sentinel-monitor"
@@ -14,11 +14,10 @@ axum = { version = "0.8", features = ["json"] }
 netstat2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 sysinfo = "0.37"
-tokio = { version = "1", features = ["rt", "sync", "time"] }
 tower = "0.5"
 
 [dev-dependencies]
 http-body-util = "0.1"
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 tower = { version = "0.5", features = ["util"] }

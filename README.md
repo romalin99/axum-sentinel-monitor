@@ -14,6 +14,27 @@ normal Tower/Axum composition.
 - Isolated monitor instances, graceful metric degradation and an explicit collector shutdown
 - No WebSocket, SSE, persistence or telemetry export; updates use ordinary HTTP polling
 
+## Fiber v3 correspondence
+
+This crate follows the current
+[Fiber v3 monitor](https://docs.gofiber.io/contrib/monitor/) metric and dashboard model:
+
+- Fiber's six charts map to process/OS CPU, process/OS/total memory, browser-observed
+  response time, process/OS TCP connections, request delta, and goroutine/thread count.
+- The browser polls at `refresh - 200ms`, with a 200ms floor, and retains the latest
+  51 points. Chart labels use real timestamps, as in Fiber v3.
+- `pid.requests` stays a decimal string. The browser uses `BigInt`, clamps the delta to
+  JavaScript's safe integer range, and treats a negative delta as a process restart.
+- Fiber's process/OS/total memory presentation and 1024-based `formatBytes` display are
+  retained. Chart values follow Fiber v3's decimal-MB convention.
+- `uptime` is shown separately from the six charts, matching the Fiber v3 page structure.
+
+Intentional Axum differences are annotated in the implementation: `MonitorLayer` replaces
+Fiber's app-wide middleware plus `Next`, each monitor owns isolated state instead of Fiber's
+package singleton, content negotiation accepts normal weighted `Accept` headers, and
+configuration values are escaped before insertion into HTML. Fiber's goroutine value maps
+to the process thread/task count available on the current platform.
+
 ## Quick start
 
 ```rust

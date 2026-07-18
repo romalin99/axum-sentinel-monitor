@@ -76,7 +76,25 @@ async fn serves_default_and_custom_dashboard_safely() {
         "text/html; charset=utf-8"
     );
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-    assert!(body(response).await.contains("Axum Sentinel Monitor"));
+    let html = body(response).await;
+    assert!(html.contains("Axum Sentinel Monitor"));
+    // Keep the complete Fiber v3 dashboard metric set and resolve all
+    // server-side template placeholders before returning the document.
+    for metric in [
+        "CPU Usage",
+        "Memory Usage",
+        "Response Time",
+        "Open Connections",
+        "Total requests",
+        "Requests / sample",
+        "Threads",
+        "Uptime",
+    ] {
+        assert!(html.contains(metric), "missing dashboard metric: {metric}");
+    }
+    assert!(html.contains("const limit=Number(\"51\")"));
+    assert!(!html.contains("__POLL_MS__"));
+    assert!(!html.contains("__HISTORY_POINTS__"));
 
     let custom = monitor(Config {
         title: "<script>bad('title')</script>".to_owned(),

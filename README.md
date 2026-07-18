@@ -57,6 +57,18 @@ async fn main() {
 Run the included example with `cargo run --example basic`, then open
 `http://127.0.0.1:3000/monitor`.
 
+The example also exposes two JSON endpoints for generating monitored traffic:
+
+```sh
+curl 'http://127.0.0.1:3000/search?name=Tom&age=18'
+curl -X POST 'http://127.0.0.1:3000/user' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Alice","age":20}'
+```
+
+The first response is `{"name":"Tom你好","age":19}`. The second assigns a
+process-local incrementing `u64` ID and returns the submitted name and age.
+
 `monitor.layer()` counts requests passing through that layer. Move the layer onto a
 sub-router if only part of the application should be counted. The monitor route itself is
 counted in the example because the layer wraps the complete application.

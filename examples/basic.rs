@@ -4,11 +4,11 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Router,
     extract::Query,
     routing::{get, post},
 };
-use axum_sentinel_monitor::{Config, Monitor};
+use axum_sentinel_monitor::{Config, Monitor, SonicJson};
 use serde::{Deserialize, Serialize};
 
 static NEXT_USER_ID: AtomicU64 = AtomicU64::new(1);
@@ -25,8 +25,8 @@ struct SearchResponse {
     age: u32,
 }
 
-async fn search(Query(params): Query<SearchParams>) -> Json<SearchResponse> {
-    Json(SearchResponse {
+async fn search(Query(params): Query<SearchParams>) -> SonicJson<SearchResponse> {
+    SonicJson(SearchResponse {
         name: format!("{}你好", params.name),
         age: params.age.saturating_add(1),
     })
@@ -45,8 +45,8 @@ struct User {
     age: u32,
 }
 
-async fn create_user(Json(input): Json<CreateUser>) -> Json<User> {
-    Json(User {
+async fn create_user(SonicJson(input): SonicJson<CreateUser>) -> SonicJson<User> {
+    SonicJson(User {
         id: NEXT_USER_ID.fetch_add(1, Ordering::Relaxed),
         name: input.name,
         age: input.age,
@@ -86,12 +86,12 @@ mod tests {
         http::{Request, StatusCode, header},
     };
     use http_body_util::BodyExt;
-    use serde_json::{Value, json};
+    use sonic_rs::{JsonValueTrait, Value, json};
     use tower::ServiceExt;
 
     async fn json_body(response: axum::response::Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        serde_json::from_slice(&bytes).unwrap()
+        sonic_rs::from_slice(&bytes).unwrap()
     }
 
     #[tokio::test]
@@ -131,5 +131,31 @@ mod tests {
         assert!(body["id"].is_u64());
         assert_eq!(body["name"], "Alice");
         assert_eq!(body["age"], 20);
+    }
+
+    #[tokio::test]
+    async fn user_rejects_non_json_and_malformed_json() {
+        let app = Router::new().route("/user", post(create_user));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/user")
+                    .body(Body::from(r#"{"name":"Alice","age":20}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let response = app
+            .oneshot(
+                Request::post("/user")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"Alice","age":"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

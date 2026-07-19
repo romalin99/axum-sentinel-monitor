@@ -11,3 +11,9 @@ The behavior and user-facing feature set of this project were informed by Fiber 
 This repository contains an independent Rust implementation and does not include Fiber's
 Go source files. Runtime Rust and browser dependencies retain their respective licenses;
 their exact resolved versions are recorded in `Cargo.lock`.
+
+JSON parsing and serialization are provided by:
+
+- Project: `cloudwego/sonic-rs`
+- License: Apache-2.0
+- Source: <https://github.com/cloudwego/sonic-rs>

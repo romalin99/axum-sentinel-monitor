@@ -11,6 +11,7 @@ normal Tower/Axum composition.
 - Host CPU, used/total memory, one-minute load average and TCP connections
 - CPU, memory, browser-observed response time, connections, requests and threads charts
 - Configurable refresh interval, title, font URL, Chart.js URL and trusted custom head HTML
+- SIMD-accelerated JSON extraction and serialization through `sonic-rs`
 - Isolated monitor instances, graceful metric degradation and an explicit collector shutdown
 - No WebSocket, SSE, persistence or telemetry export; updates use ordinary HTTP polling
 
@@ -168,6 +169,36 @@ Response time is measured in the browser around the polling request, matching Fi
 Monitor; it is not server handler latency. The headline shows the raw latest value while
 the chart uses an EWMA (`alpha = 0.2`) to reduce browser scheduling jitter. Request chart
 points are counts since the prior poll, not requests per second.
+
+### JSON implementation
+
+The monitor API and example request handlers use the public `SonicJson<T>` extractor and
+response wrapper, backed by [`sonic-rs`](https://github.com/cloudwego/sonic-rs). Axum's
+`json` feature is disabled, so `serde_json` is not present in the dependency graph.
+
+```rust
+use axum_sentinel_monitor::SonicJson;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct Input {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct Output {
+    message: String,
+}
+
+async fn handler(SonicJson(input): SonicJson<Input>) -> SonicJson<Output> {
+    SonicJson(Output {
+        message: format!("hello {}", input.name),
+    })
+}
+```
+
+The extractor accepts `application/json` and `application/*+json`. Missing or unsupported
+content types return `415`; malformed JSON returns `400`.
 
 ## Security
 

@@ -3,6 +3,7 @@
 mod config;
 mod dashboard;
 mod handler;
+mod json;
 mod metrics;
 
 use std::{
@@ -14,6 +15,7 @@ use axum::{Router, http::Request};
 use tower::{Layer, Service};
 
 pub use config::Config;
+pub use json::{SonicJson, SonicJsonRejection};
 pub use metrics::{
     MetricSample, MetricsCollector, OsMetrics, ProcessMetrics, Snapshot, SystemCollector,
 };

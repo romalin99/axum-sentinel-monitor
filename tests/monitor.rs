@@ -14,7 +14,7 @@ use axum::{
 };
 use axum_sentinel_monitor::{Config, MetricSample, MetricsCollector, Monitor};
 use http_body_util::BodyExt;
-use serde_json::Value;
+use sonic_rs::{JsonValueTrait, Value};
 use tower::ServiceExt;
 
 #[derive(Clone)]
@@ -135,11 +135,11 @@ async fn serves_documented_json_schema_with_accept_negotiation() {
         response.headers()[header::CONTENT_TYPE],
         "application/json; charset=utf-8"
     );
-    let value: Value = serde_json::from_str(&body(response).await).unwrap();
+    let value: Value = sonic_rs::from_str(&body(response).await).unwrap();
     for field in ["cpu", "ram", "conns", "goroutines", "uptime"] {
         assert!(value["pid"][field].is_number(), "pid.{field}");
     }
-    assert!(value["pid"]["requests"].is_string());
+    assert!(value["pid"]["requests"].is_str());
     for field in ["cpu", "ram", "total_ram", "load_avg", "conns"] {
         assert!(value["os"][field].is_number(), "os.{field}");
     }

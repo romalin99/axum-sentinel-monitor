@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Router,
     extract::State,
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::any,
 };
 
-use crate::{Config, dashboard, metrics::MetricsState};
+use crate::{Config, SonicJson, dashboard, metrics::MetricsState};
 
 #[derive(Clone)]
 pub(crate) struct HandlerState {
@@ -35,7 +35,7 @@ async fn endpoint(
 
     let json = state.config.api_only || prefers_json(&headers);
     let mut response = if json {
-        Json(state.metrics.snapshot()).into_response()
+        SonicJson(state.metrics.snapshot()).into_response()
     } else {
         Html(dashboard::render(&state.config)).into_response()
     };

@@ -298,7 +298,7 @@
       background: var(--panel-soft);
     }
     .sample-toggle button {
-      min-width: 36px;
+      min-width: 42px;
       height: 24px;
       padding: 0 9px;
       border: 0;
@@ -317,6 +317,308 @@
     .sample-toggle button[aria-pressed="true"] {
       background: var(--accent);
       color: var(--bg);
+    }
+    .page-tabs {
+      display: flex;
+      gap: 2px;
+      margin-top: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .page-tab {
+      min-width: 88px;
+      height: 34px;
+      padding: 0 16px;
+      border: 0;
+      border-bottom: 2px solid transparent;
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      box-shadow: none;
+    }
+    .page-tab:hover {
+      transform: none;
+      color: var(--text);
+    }
+    .page-tab[aria-selected="true"] {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+    .page-panel[hidden] {
+      display: none;
+    }
+    .page-runtime .cards {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 18px;
+    }
+    .kpi-card {
+      min-width: 0;
+      padding: 14px 16px 16px;
+      border: 3px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .kpi-label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .kpi-card strong {
+      display: block;
+      margin-top: 8px;
+      overflow-wrap: anywhere;
+      font-size: clamp(1.15rem, 2vw, 1.55rem);
+      font-variant-numeric: tabular-nums;
+      font-weight: 800;
+      line-height: 1.15;
+    }
+    .kpi-card em {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-style: normal;
+      font-variant-numeric: tabular-nums;
+    }
+    .api-note {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+    .api-charts {
+      display: grid;
+      gap: 14px;
+      margin-top: 16px;
+    }
+    .api-charts .span-2 {
+      grid-column: 1 / -1;
+    }
+    .api-split {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .status-bars {
+      display: grid;
+      gap: 10px;
+      min-height: 168px;
+      align-content: center;
+    }
+    .status-bar {
+      display: grid;
+      grid-template-columns: 36px minmax(0, 1fr) 54px;
+      gap: 10px;
+      align-items: center;
+      font-size: 0.82rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .status-bar span:first-child {
+      color: var(--muted);
+      font-weight: 800;
+    }
+    .status-bar span:last-child {
+      text-align: right;
+      font-weight: 800;
+    }
+    .status-meter {
+      height: 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: var(--panel-soft);
+    }
+    .status-meter i {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--accent);
+    }
+    .status-bar[data-class="4xx"] .status-meter i { background: var(--warn); }
+    .status-bar[data-class="5xx"] .status-meter i { background: var(--bad); }
+    .status-bar[data-class="2xx"] .status-meter i { background: var(--good); }
+    .endpoint-panel {
+      margin-top: 18px;
+      padding: 14px 16px 10px;
+      border: 3px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .endpoint-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .endpoint-head h2 {
+      margin: 0;
+      color: var(--text);
+      letter-spacing: 0;
+      text-transform: none;
+      font-size: 1.05rem;
+    }
+    .endpoint-filters {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .endpoint-filter {
+      height: 26px;
+      padding: 0 11px;
+      border: 0;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel-soft), transparent 8%);
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 800;
+      box-shadow: none;
+    }
+    .endpoint-filter:hover {
+      transform: none;
+      color: var(--text);
+    }
+    .endpoint-filter[aria-pressed="true"] {
+      background: #22c55e;
+      color: #052e16;
+    }
+    .endpoint-list {
+      display: grid;
+      gap: 2px;
+      max-height: min(560px, 58vh);
+      overflow: auto;
+    }
+    .endpoint-row {
+      display: grid;
+      grid-template-columns: 56px minmax(0, 1fr) minmax(228px, 280px);
+      gap: 8px 14px;
+      padding: 7px 4px 8px;
+      align-items: center;
+    }
+    .endpoint-count {
+      display: grid;
+      justify-items: end;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+      line-height: 1.1;
+    }
+    .endpoint-count b {
+      font-size: 1.12rem;
+      font-weight: 800;
+    }
+    .endpoint-live {
+      color: var(--accent);
+      font-size: 0.68rem;
+      font-style: normal;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+    .endpoint-live:before {
+      content: "in ";
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .endpoint-row.is-live {
+      box-shadow: inset 2px 0 0 var(--accent);
+    }
+    .endpoint-main {
+      min-width: 0;
+    }
+    .endpoint-line {
+      display: grid;
+      grid-template-columns: minmax(0, max-content) minmax(48px, 1fr);
+      gap: 10px;
+      align-items: center;
+    }
+    .endpoint-route {
+      overflow: hidden;
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.86rem;
+      font-weight: 700;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+    .endpoint-method {
+      display: inline-block;
+      min-width: 3.1em;
+      margin-right: 8px;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: color-mix(in srgb, currentColor 16%, transparent);
+      font-weight: 800;
+      font-size: 0.72rem;
+      text-align: center;
+    }
+    .endpoint-method[data-method="GET"] { color: var(--good); }
+    .endpoint-method[data-method="POST"] { color: var(--accent); }
+    .endpoint-method[data-method="PUT"],
+    .endpoint-method[data-method="PATCH"] { color: var(--warn); }
+    .endpoint-method[data-method="DELETE"] { color: var(--bad); }
+    .endpoint-bar {
+      height: 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--border), transparent 35%);
+    }
+    .endpoint-bar i {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: #4ade80;
+    }
+    .endpoint-row[data-class="success"] .endpoint-bar i { background: #4ade80; }
+    .endpoint-row[data-class="redirect"] .endpoint-bar i { background: #38bdf8; }
+    .endpoint-row[data-class="client"] .endpoint-bar i { background: #facc15; }
+    .endpoint-row[data-class="server"] .endpoint-bar i { background: #fb7185; }
+    .endpoint-row[data-class="inflight"] .endpoint-bar i { background: var(--accent); }
+    .endpoint-stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 2px 8px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 0.68rem;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+    .endpoint-stats span {
+      display: grid;
+      gap: 1px;
+      min-width: 0;
+    }
+    .endpoint-stats small {
+      overflow: hidden;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .endpoint-stats b {
+      overflow: hidden;
+      color: var(--text);
+      font-size: 0.82rem;
+      font-weight: 800;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .endpoint-empty {
+      padding: 18px 8px 14px;
+      color: var(--muted);
+      font-size: 0.88rem;
     }
     .chart-grid {
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -470,7 +772,7 @@
     .legend-dot[data-series="os"], .legend-dot[data-series="max"], .legend-dot[data-series="last"] {
       background: var(--warn);
     }
-    .legend-dot[data-series="heap"] {
+    .legend-dot[data-series="heap"], .legend-dot[data-series="p95"] {
       background: var(--good);
     }
     .legend-dot[data-series="bad"] {
@@ -709,7 +1011,10 @@
       letter-spacing: 0;
     }
     @media (max-width: 980px) {
-      .cards {
+      .cards,
+      .page-runtime .cards,
+      .kpi-grid,
+      .api-split {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
       .chart-grid {
@@ -742,14 +1047,27 @@
       }
     }
     @media (max-width: 560px) {
-      .cards {
+      .cards,
+      .page-runtime .cards,
+      .kpi-grid,
+      .api-split {
         grid-template-columns: 1fr;
       }
       .disk-item dl {
         grid-template-columns: 1fr;
       }
-      .section-title {
-        gap: 10px;
+      .endpoint-head {
+        flex-wrap: wrap;
+      }
+      .endpoint-row {
+        grid-template-columns: 52px minmax(0, 1fr);
+      }
+      .endpoint-stats {
+        grid-column: 1 / -1;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        justify-items: start;
+        text-align: left;
+        padding: 0 4px 2px 52px;
       }
       .sample-toggle button {
         min-width: 32px;
@@ -782,74 +1100,100 @@
     </header>
     <div class="header-divider" aria-hidden="true"></div>
     <aside class="description-card" aria-label="Page description"><p>__MONITOR_DESCRIPTION__</p></aside>
+    <nav class="page-tabs" role="tablist" aria-label="Monitor pages">
+      <button type="button" class="page-tab" id="tab-runtime" data-page="runtime" role="tab" aria-controls="page-runtime" aria-selected="true">Runtime</button>
+      <button type="button" class="page-tab" id="tab-api" data-page="api" role="tab" aria-controls="page-api" aria-selected="false">API</button>
+    </nav>
 
-    <div class="cards">
-      <section class="metric-card">
-        <div class="metric-card__head"><h2>Process</h2><div class="metric-pager" hidden><button type="button" class="metric-pager__prev" aria-label="Previous metric page">&lt;</button><span class="metric-pager__status">1 / 1</span><button type="button" class="metric-pager__next" aria-label="Next metric page">&gt;</button></div></div>
-        <dl>
-          <div class="row"><dt>CPU</dt><dd id="pid-cpu">-</dd></div>
-          <div class="row"><dt>RSS</dt><dd id="pid-rss">-</dd></div>
-          <div class="row"><dt>Threads</dt><dd id="pid-threads">-</dd></div>
-          <div class="row"><dt>PID</dt><dd>__MONITOR_PID__</dd></div>
-          <div class="row"><dt>__MONITOR_DESCRIPTOR_LABEL__</dt><dd id="pid-fds">-</dd></div>
-        </dl>
-      </section>
-      <section class="metric-card">
-        <div class="metric-card__head"><h2>Runtime</h2><div class="metric-pager" hidden><button type="button" class="metric-pager__prev" aria-label="Previous metric page">&lt;</button><span class="metric-pager__status">1 / 1</span><button type="button" class="metric-pager__next" aria-label="Next metric page">&gt;</button></div></div>
-        <dl>
-          <div class="row"><dt>Tasks</dt><dd id="rt-goroutines">-</dd></div>
-          <div class="row"><dt>Heap</dt><dd><button type="button" id="heap-details-button" class="metric-action" aria-haspopup="dialog" aria-controls="heap-modal">-</button></dd></div>
-          <div class="row"><dt>Workers</dt><dd id="rt-workers">-</dd></div>
-          <div class="row"><dt>Uptime</dt><dd id="rt-uptime">-</dd></div>
-        </dl>
-      </section>
-      <section class="metric-card">
-        <div class="metric-card__head"><h2>System</h2><div class="metric-pager" hidden><button type="button" class="metric-pager__prev" aria-label="Previous metric page">&lt;</button><span class="metric-pager__status">1 / 1</span><button type="button" class="metric-pager__next" aria-label="Next metric page">&gt;</button></div></div>
-        <dl>
-          <div class="row"><dt>CPU</dt><dd id="os-cpu">-</dd></div>
-          <div class="row"><dt>Memory</dt><dd id="os-memory">-</dd></div>
-          <div class="row"><dt>Total RAM</dt><dd id="os-total">-</dd></div>
-          <div class="row"><dt>Disk</dt><dd><button type="button" id="disk-details-button" class="metric-action" aria-haspopup="dialog" aria-controls="disk-modal">-</button></dd></div>
-          <div class="row"><dt>1m load</dt><dd id="os-load">-</dd></div>
-          <div class="row"><dt>Available RAM</dt><dd id="os-available">-</dd></div>
-          <div class="row"><dt>5m load</dt><dd id="os-load-5">-</dd></div>
-          <div class="row"><dt>15m load</dt><dd id="os-load-15">-</dd></div>
-          <div class="row"><dt>RX rate</dt><dd id="os-network-rx-rate">-</dd></div>
-          <div class="row"><dt>TX rate</dt><dd id="os-network-tx-rate">-</dd></div>
-        </dl>
-      </section>
-      <section class="metric-card">
-        <div class="metric-card__head"><h2>HTTP</h2><div class="metric-pager" hidden><button type="button" class="metric-pager__prev" aria-label="Previous metric page">&lt;</button><span class="metric-pager__status">1 / 1</span><button type="button" class="metric-pager__next" aria-label="Next metric page">&gt;</button></div></div>
-        <dl>
-          <div class="row"><dt>RPS</dt><dd id="http-rps">-</dd></div>
-          <div class="row"><dt>P95 latency</dt><dd id="http-latency-p95">-</dd></div>
-          <div class="row"><dt>Error rate</dt><dd id="http-error-rate">-</dd></div>
-          <div class="row"><dt>In-flight</dt><dd id="http-in-flight">-</dd></div>
-          <div class="row"><dt>Requests</dt><dd id="http-requests">-</dd></div>
-          <div class="row"><dt>P50 latency</dt><dd id="http-latency-p50">-</dd></div>
-          <div class="row"><dt>P99 latency</dt><dd id="http-latency-p99">-</dd></div>
-          <div class="row"><dt>Status codes</dt><dd><button type="button" id="http-status-button" class="metric-action" aria-haspopup="dialog" aria-controls="http-status-modal">-</button></dd></div>
-        </dl>
-      </section>
-    </div>
-
-    <div class="chart-section">
-      <div class="section-title">
-        <h2>Trends</h2>
-        <div class="sample-toggle" role="group" aria-label="Chart sample window">
-          <button type="button" class="sample-option" data-samples="30" aria-pressed="false">30</button>
-          <button type="button" class="sample-option" data-samples="60" aria-pressed="true">60</button>
-          <button type="button" class="sample-option" data-samples="90" aria-pressed="false">90</button>
+    <div id="page-runtime" class="page-panel page-runtime is-active" role="tabpanel" aria-labelledby="tab-runtime">
+      <div class="cards">
+        <section class="metric-card">
+          <div class="metric-card__head"><h2>Process</h2><div class="metric-pager" hidden><button type="button" class="metric-pager__prev" aria-label="Previous metric page">&lt;</button><span class="metric-pager__status">1 / 1</span><button type="button" class="metric-pager__next" aria-label="Next metric page">&gt;</button></div></div>
+          <dl>
+            <div class="row"><dt>CPU</dt><dd id="pid-cpu">-</dd></div>
+            <div class="row"><dt>RSS</dt><dd id="pid-rss">-</dd></div>
+            <div class="row"><dt>Threads</dt><dd id="pid-threads">-</dd></div>
+            <div class="row"><dt>PID</dt><dd>__MONITOR_PID__</dd></div>
+            <div class="row"><dt>__MONITOR_DESCRIPTOR_LABEL__</dt><dd id="pid-fds">-</dd></div>
+          </dl>
+        </section>
+        <section class="metric-card">
+          <div class="metric-card__head"><h2>Runtime</h2><div class="metric-pager" hidden><button type="button" class="metric-pager__prev" aria-label="Previous metric page">&lt;</button><span class="metric-pager__status">1 / 1</span><button type="button" class="metric-pager__next" aria-label="Next metric page">&gt;</button></div></div>
+          <dl>
+            <div class="row"><dt>Tasks</dt><dd id="rt-goroutines">-</dd></div>
+            <div class="row"><dt>Heap</dt><dd><button type="button" id="heap-details-button" class="metric-action" aria-haspopup="dialog" aria-controls="heap-modal">-</button></dd></div>
+            <div class="row"><dt>Workers</dt><dd id="rt-workers">-</dd></div>
+            <div class="row"><dt>Uptime</dt><dd id="rt-uptime">-</dd></div>
+          </dl>
+        </section>
+        <section class="metric-card">
+          <div class="metric-card__head"><h2>System</h2><div class="metric-pager" hidden><button type="button" class="metric-pager__prev" aria-label="Previous metric page">&lt;</button><span class="metric-pager__status">1 / 1</span><button type="button" class="metric-pager__next" aria-label="Next metric page">&gt;</button></div></div>
+          <dl>
+            <div class="row"><dt>CPU</dt><dd id="os-cpu">-</dd></div>
+            <div class="row"><dt>Memory</dt><dd id="os-memory">-</dd></div>
+            <div class="row"><dt>Total RAM</dt><dd id="os-total">-</dd></div>
+            <div class="row"><dt>Disk</dt><dd><button type="button" id="disk-details-button" class="metric-action" aria-haspopup="dialog" aria-controls="disk-modal">-</button></dd></div>
+            <div class="row"><dt>1m load</dt><dd id="os-load">-</dd></div>
+            <div class="row"><dt>Available RAM</dt><dd id="os-available">-</dd></div>
+            <div class="row"><dt>5m load</dt><dd id="os-load-5">-</dd></div>
+            <div class="row"><dt>15m load</dt><dd id="os-load-15">-</dd></div>
+            <div class="row"><dt>RX rate</dt><dd id="os-network-rx-rate">-</dd></div>
+            <div class="row"><dt>TX rate</dt><dd id="os-network-tx-rate">-</dd></div>
+          </dl>
+        </section>
+      </div>
+      <div class="chart-section">
+        <div class="section-title"><h2>Trends</h2></div>
+        <div class="chart-grid">
+          <article class="chart-card"><div class="chart-head"><span>CPU</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="pid"></span>Process</span><span class="legend-item"><span class="legend-dot" data-series="os"></span>System</span></span></div><canvas id="cpu-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
+          <article class="chart-card"><div class="chart-head"><span>Memory</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="rss"></span>RSS</span><span class="legend-item"><span class="legend-dot" data-series="heap"></span>Heap</span></span></div><canvas id="memory-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
+          <article class="chart-card"><div class="chart-head"><span>Network</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="pid"></span>RX/s</span><span class="legend-item"><span class="legend-dot" data-series="os"></span>TX/s</span></span></div><canvas id="network-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
+          <article class="chart-card"><div class="chart-head"><span>Tasks</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="main"></span>Count</span></span></div><canvas id="goroutine-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
         </div>
       </div>
-      <div class="chart-grid">
-        <article class="chart-card"><div class="chart-head"><span>CPU</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="pid"></span>Process</span><span class="legend-item"><span class="legend-dot" data-series="os"></span>System</span></span></div><canvas id="cpu-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
-        <article class="chart-card"><div class="chart-head"><span>Memory</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="rss"></span>RSS</span><span class="legend-item"><span class="legend-dot" data-series="heap"></span>Heap</span></span></div><canvas id="memory-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
-        <article class="chart-card"><div class="chart-head"><span>Network</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="pid"></span>RX/s</span><span class="legend-item"><span class="legend-dot" data-series="os"></span>TX/s</span></span></div><canvas id="network-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
-        <article class="chart-card"><div class="chart-head"><span>Tasks</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="main"></span>Count</span></span></div><canvas id="goroutine-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
-        <article class="chart-card"><div class="chart-head"><span>Requests / second</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="main"></span>RPS</span></span></div><canvas id="request-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
-        <article class="chart-card"><div class="chart-head"><span>HTTP latency</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="recent"></span>P50</span><span class="legend-item"><span class="legend-dot" data-series="max"></span>P95</span><span class="legend-item"><span class="legend-dot" data-series="bad"></span>P99</span></span></div><canvas id="latency-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
-        <article class="chart-card"><div class="chart-head"><span>HTTP Error Rate</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="max"></span>4xx</span><span class="legend-item"><span class="legend-dot" data-series="bad"></span>5xx</span></span></div><canvas id="http-error-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
+    </div>
+
+    <div id="page-api" class="page-panel page-api" role="tabpanel" aria-labelledby="tab-api" hidden>
+      <div class="chart-section">
+        <div class="section-title">
+          <h2>API</h2>
+          <div class="sample-toggle" role="group" aria-label="QPS window">
+            <button type="button" class="sample-option" data-samples="30" aria-pressed="false">30s</button>
+            <button type="button" class="sample-option" data-samples="60" aria-pressed="true">60s</button>
+          </div>
+        </div>
+        <p class="api-note" id="api-window-note">Last 60 seconds. Samples older than 60s are discarded.</p>
+        <div class="kpi-grid">
+          <article class="kpi-card"><span class="kpi-label">QPS</span><strong id="kpi-qps">-</strong><em id="kpi-in-flight">In-flight -</em></article>
+          <article class="kpi-card"><span class="kpi-label">Requests</span><strong id="kpi-requests">-</strong><em id="kpi-lifetime">Lifetime -</em></article>
+          <article class="kpi-card"><span class="kpi-label">Success</span><strong id="kpi-success">-</strong><em>2xx + 3xx</em></article>
+          <article class="kpi-card"><span class="kpi-label">Error rate</span><strong id="kpi-error">-</strong><em>4xx + 5xx</em></article>
+          <article class="kpi-card"><span class="kpi-label">P50</span><strong id="kpi-p50">-</strong></article>
+          <article class="kpi-card"><span class="kpi-label">P95</span><strong id="kpi-p95">-</strong></article>
+          <article class="kpi-card"><span class="kpi-label">P99</span><strong id="kpi-p99">-</strong></article>
+          <article class="kpi-card"><span class="kpi-label">P999</span><strong id="kpi-p999">-</strong></article>
+        </div>
+        <section class="endpoint-panel" aria-label="Endpoints">
+          <div class="endpoint-head">
+            <h2>Endpoints</h2>
+            <div class="endpoint-filters" role="group" aria-label="Endpoint status filter">
+              <button type="button" class="endpoint-filter" data-filter="all" aria-pressed="true">All</button>
+              <button type="button" class="endpoint-filter" data-filter="success" aria-pressed="false">Success</button>
+              <button type="button" class="endpoint-filter" data-filter="redirect" aria-pressed="false">Redirect</button>
+              <button type="button" class="endpoint-filter" data-filter="client" aria-pressed="false">Client</button>
+              <button type="button" class="endpoint-filter" data-filter="server" aria-pressed="false">Server</button>
+            </div>
+          </div>
+          <div id="endpoint-list" class="endpoint-list"></div>
+        </section>
+        <div class="api-charts">
+          <article class="chart-card span-2"><div class="chart-head"><span>QPS</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="main"></span>req/s</span></span></div><canvas id="request-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
+          <article class="chart-card span-2"><div class="chart-head"><span>Latency</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="recent"></span>P50</span><span class="legend-item"><span class="legend-dot" data-series="p95"></span>P95</span><span class="legend-item"><span class="legend-dot" data-series="max"></span>P99</span><span class="legend-item"><span class="legend-dot" data-series="bad"></span>P999</span></span></div><canvas id="latency-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
+          <div class="api-split">
+            <article class="chart-card"><div class="chart-head"><span>Error rate</span><span class="chart-legend legend-list"><span class="legend-item"><span class="legend-dot" data-series="max"></span>4xx</span><span class="legend-item"><span class="legend-dot" data-series="bad"></span>5xx</span></span></div><canvas id="http-error-chart"></canvas><div class="chart-tooltip" role="tooltip" hidden></div></article>
+            <article class="chart-card"><div class="chart-head"><span>Status codes</span><button type="button" id="http-status-button" class="metric-action" aria-haspopup="dialog" aria-controls="http-status-modal">-</button></div><div id="status-bars" class="status-bars"></div></article>
+          </div>
+        </div>
       </div>
     </div>
     <footer>__MONITOR_FOOTER__</footer>
@@ -886,8 +1230,8 @@
 (() => {
     "use strict";
     const REFRESH_MS = __MONITOR_REFRESH_MS__;
-    const MAX_SAMPLES = 90;
-    const SAMPLE_WINDOWS = [30, 60, 90];
+    const MAX_SAMPLES = 60;
+    const SAMPLE_WINDOWS = [30, 60];
     const dash = "\u2014";
     const history = {
       labels: [],
@@ -897,21 +1241,20 @@
       heap: [],
       networkRX: [],
       networkTX: [],
-      goroutines: [],
-      rps: [],
-      p50: [],
-      p95: [],
-      p99: [],
-      error4xx: [],
-      error5xx: []
+      goroutines: []
     };
+    let httpSeries = [];
+    let lastSnapshot = null;
     let currentSampleWindow = 60;
+    let currentPage = "runtime";
     let currentTheme = "";
     let themeOverridden = false;
     let currentRuntime = {};
     let currentSystem = {};
     let currentHTTPStatus = {};
     let currentHTTPRates = {};
+    let currentEndpoints = [];
+    let currentEndpointFilter = "all";
     let lastCollectedAt = "";
     let hasUsableSnapshot = false;
     let resizeFrame = 0;
@@ -1002,22 +1345,178 @@
         button.setAttribute("aria-pressed", button.dataset.samples === String(currentSampleWindow) ? "true" : "false");
       });
       if (persist) storageSet("monitor.samples", String(currentSampleWindow));
+      if (lastSnapshot) renderMetrics(lastSnapshot);
       drawCharts();
+    }
+
+    function httpSlice() {
+      return httpSeries.slice(Math.max(0, httpSeries.length - currentSampleWindow));
+    }
+
+    function selectedWindow(http) {
+      const windows = http && http.windows ? http.windows : {};
+      const selected = windows[String(currentSampleWindow)];
+      if (selected) return selected;
+      return {
+        rps: http && http.rps,
+        requests: 0,
+        covered_seconds: currentSampleWindow,
+        seconds: currentSampleWindow,
+        status: http && http.status ? http.status : {},
+        rates: http && http.rates ? http.rates : {},
+        latency: http && http.latency ? http.latency : {}
+      };
+    }
+
+    function statusCount(sample, code) {
+      const status = sample && sample.status ? sample.status : {};
+      if (finite(status[code])) return status[code];
+      if (code === "4xx") return sample && finite(sample.status_4xx) ? sample.status_4xx : 0;
+      if (code === "5xx") return sample && finite(sample.status_5xx) ? sample.status_5xx : 0;
+      return 0;
+    }
+
+    function endpointWindow(endpoint) {
+      const windows = endpoint && endpoint.windows ? endpoint.windows : {};
+      return windows[String(currentSampleWindow)] || windows["60"] || {};
+    }
+
+    function endpointFilterCount(endpoint, filter) {
+      const selected = endpointWindow(endpoint);
+      const status = selected.status || {};
+      if (filter === "success") return status["2xx"] || 0;
+      if (filter === "redirect") return status["3xx"] || 0;
+      if (filter === "client") return status["4xx"] || 0;
+      if (filter === "server") return status["5xx"] || 0;
+      return selected.requests || 0;
+    }
+
+    function endpointClass(endpoint, count) {
+      if (!(count > 0) && (endpoint.in_flight || 0) > 0) return "inflight";
+      const selected = endpointWindow(endpoint);
+      const status = selected.status || {};
+      const ranked = [
+        ["server", status["5xx"] || 0],
+        ["client", status["4xx"] || 0],
+        ["redirect", status["3xx"] || 0],
+        ["success", status["2xx"] || 0]
+      ].sort((left, right) => right[1] - left[1]);
+      return ranked[0][1] > 0 ? ranked[0][0] : "success";
+    }
+
+    function applyEndpointFilter(filter, persist) {
+      currentEndpointFilter = ["all", "success", "redirect", "client", "server"].includes(filter) ?
+        filter : "all";
+      document.querySelectorAll(".endpoint-filter").forEach((button) => {
+        button.setAttribute("aria-pressed", button.dataset.filter === currentEndpointFilter ? "true" : "false");
+      });
+      if (persist) storageSet("monitor.endpointFilter", currentEndpointFilter);
+      renderEndpoints(currentEndpoints);
+    }
+
+    function renderEndpoints(endpoints) {
+      const list = byId("endpoint-list");
+      if (!list) return;
+      currentEndpoints = Array.isArray(endpoints) ? endpoints.slice() : [];
+      const rows = currentEndpoints
+        .map((endpoint) => {
+          const count = endpointFilterCount(endpoint, currentEndpointFilter);
+          const inFlight = endpoint.in_flight || 0;
+          const shown = count > 0 ? count : (currentEndpointFilter === "all" ? inFlight : 0);
+          return { endpoint, count, inFlight, shown };
+        })
+        .filter((row) => row.shown > 0)
+        .sort((left, right) => {
+          if (currentEndpointFilter === "all") {
+            const leftLive = left.inFlight > 0 ? 1 : 0;
+            const rightLive = right.inFlight > 0 ? 1 : 0;
+            if (leftLive !== rightLive) return rightLive - leftLive;
+            if (leftLive) {
+              return right.inFlight - left.inFlight || right.shown - left.shown ||
+                String(left.endpoint.method).localeCompare(String(right.endpoint.method)) ||
+                String(left.endpoint.path).localeCompare(String(right.endpoint.path));
+            }
+          }
+          return right.shown - left.shown ||
+            String(left.endpoint.method).localeCompare(String(right.endpoint.method)) ||
+            String(left.endpoint.path).localeCompare(String(right.endpoint.path));
+        });
+      list.replaceChildren();
+      if (!rows.length) {
+        const empty = document.createElement("div");
+        empty.className = "endpoint-empty";
+        empty.textContent = currentEndpointFilter === "all"
+          ? "No requests or in-flight calls in this " + currentSampleWindow + "s window."
+          : "No requests in this " + currentSampleWindow + "s window.";
+        list.append(empty);
+        return;
+      }
+      const trafficMax = Math.max(1, ...rows.filter((row) => row.count > 0).map((row) => row.count), 1);
+      const inflightMax = Math.max(1, ...rows.filter((row) => row.count === 0).map((row) => row.inFlight), 1);
+      rows.forEach((row) => {
+        const selected = endpointWindow(row.endpoint);
+        const latency = selected.latency || {};
+        const method = String(row.endpoint.method || "GET").toUpperCase();
+        const item = document.createElement("article");
+        item.className = "endpoint-row";
+        item.dataset.class = endpointClass(row.endpoint, row.count);
+        if (row.inFlight > 0) item.classList.add("is-live");
+        const count = document.createElement("div");
+        count.className = "endpoint-count";
+        const countValue = document.createElement("b");
+        countValue.textContent = integer.format(row.shown);
+        count.append(countValue);
+        if (row.count > 0 && row.inFlight > 0) {
+          const live = document.createElement("em");
+          live.className = "endpoint-live";
+          live.title = "In-flight";
+          live.textContent = integer.format(row.inFlight);
+          count.append(live);
+        }
+        const main = document.createElement("div");
+        main.className = "endpoint-main";
+        const line = document.createElement("div");
+        line.className = "endpoint-line";
+        const route = document.createElement("div");
+        route.className = "endpoint-route";
+        route.title = method + " " + (row.endpoint.path || "/");
+        const methodNode = document.createElement("span");
+        methodNode.className = "endpoint-method";
+        methodNode.dataset.method = method;
+        methodNode.textContent = method;
+        route.append(methodNode, document.createTextNode(" " + (row.endpoint.path || "/")));
+        const bar = document.createElement("div");
+        bar.className = "endpoint-bar";
+        const fill = document.createElement("i");
+        const barMax = row.count > 0 ? trafficMax : inflightMax;
+        fill.style.width = (row.shown / barMax * 100) + "%";
+        bar.append(fill);
+        line.append(route, bar);
+        main.append(line);
+        const stats = document.createElement("div");
+        stats.className = "endpoint-stats";
+        const qps = row.count > 0 ? optional(selected.rps, (value) => value.toFixed(2)) : dash;
+        [
+          ["QPS", qps],
+          ["P50", optional(latency.p50_ns, formatDurationNS)],
+          ["P99", optional(latency.p99_ns, formatDurationNS)],
+          ["P999", optional(latency.p999_ns, formatDurationNS)]
+        ].forEach(([label, value]) => {
+          const chip = document.createElement("span");
+          const name = document.createElement("small");
+          name.textContent = label;
+          const strong = document.createElement("b");
+          strong.textContent = value;
+          chip.append(name, strong);
+          stats.append(chip);
+        });
+        item.append(count, main, stats);
+        list.append(item);
+      });
     }
 
     function visibleSamples(values) {
       return values.slice(Math.max(0, values.length - currentSampleWindow));
-    }
-
-    function fillForward(values) {
-      let previous = null;
-      return values.map((value) => {
-        if (finite(value)) {
-          previous = value;
-          return value;
-        }
-        return finite(previous) ? previous : null;
-      });
     }
 
     function fillZero(values) {
@@ -1100,6 +1599,30 @@
       return (status["1xx"] || 0) + (status["2xx"] || 0) + (status["3xx"] || 0) + (status["4xx"] || 0) + (status["5xx"] || 0);
     }
 
+    function renderStatusBars(status) {
+      const container = byId("status-bars");
+      if (!container) return;
+      container.replaceChildren();
+      const rows = ["1xx", "2xx", "3xx", "4xx", "5xx"].map((code) => [code, status[code] || 0]);
+      const max = Math.max(1, ...rows.map((row) => row[1]));
+      rows.forEach(([code, count]) => {
+        const row = document.createElement("div");
+        row.className = "status-bar";
+        row.dataset.class = code;
+        const label = document.createElement("span");
+        label.textContent = code;
+        const meter = document.createElement("div");
+        meter.className = "status-meter";
+        const bar = document.createElement("i");
+        bar.style.width = (count / max * 100) + "%";
+        meter.append(bar);
+        const value = document.createElement("span");
+        value.textContent = integer.format(count);
+        row.append(label, meter, value);
+        container.append(row);
+      });
+    }
+
     function renderHTTPStatusDetails() {
       const status = currentHTTPStatus;
       const rates = currentHTTPRates;
@@ -1115,20 +1638,53 @@
       ]);
     }
 
+    function applyPage(page, persist) {
+      const next = page === "api" ? "api" : "runtime";
+      currentPage = next;
+      document.querySelectorAll(".page-tab").forEach((button) => {
+        button.setAttribute("aria-selected", button.dataset.page === currentPage ? "true" : "false");
+      });
+      document.querySelectorAll(".page-panel").forEach((panel) => {
+        const active = panel.id === "page-" + currentPage;
+        panel.hidden = !active;
+        panel.classList.toggle("is-active", active);
+      });
+      if (persist) {
+        storageSet("monitor.page", currentPage);
+        const hash = "#" + currentPage;
+        if (location.hash !== hash) {
+          history.replaceState(null, "", hash);
+        }
+      }
+      window.requestAnimationFrame(() => {
+        drawCharts();
+        updateScrollDock();
+      });
+    }
+
     function renderMetrics(snapshot) {
+      lastSnapshot = snapshot;
       const process = snapshot.process || {};
       currentRuntime = snapshot.runtime || {};
       currentSystem = snapshot.system || {};
       const http = snapshot.http || {};
-      currentHTTPStatus = http.status || {};
-      currentHTTPRates = http.rates || {};
-      const latency = http.latency || {};
+      const selected = selectedWindow(http);
+      httpSeries = Array.isArray(http.series) ? http.series : [];
+      currentHTTPStatus = selected.status || {};
+      currentHTTPRates = selected.rates || {};
+      const latency = selected.latency || {};
       const errorRate = finite(currentHTTPRates["4xx"]) && finite(currentHTTPRates["5xx"]) ?
-        currentHTTPRates["4xx"] + currentHTTPRates["5xx"] : null;
+        currentHTTPRates["4xx"] + currentHTTPRates["5xx"] : (finite(currentHTTPRates["4xx"]) ?
+          currentHTTPRates["4xx"] : (finite(currentHTTPRates["5xx"]) ? currentHTTPRates["5xx"] : null));
+      const successRate = finite(selected.requests) && selected.requests > 0 ?
+        ((currentHTTPStatus["2xx"] || 0) + (currentHTTPStatus["3xx"] || 0)) / selected.requests : null;
       const collectionErrors = snapshot.collection && Array.isArray(snapshot.collection.errors) ?
         snapshot.collection.errors : [];
       const loadUnsupported = !finite(currentSystem.load1) && !finite(currentSystem.load5) &&
         !finite(currentSystem.load15) && !collectionErrors.includes("system.load");
+      const covered = finite(selected.covered_seconds) ? selected.covered_seconds : currentSampleWindow;
+      setText("api-window-note", "Last " + currentSampleWindow + "s window (" + covered +
+        "s covered). Samples older than 60s are discarded.");
 
       setText("pid-cpu", percent(process.cpu_percent));
       setText("pid-rss", optional(process.rss_bytes, formatBytes));
@@ -1148,20 +1704,25 @@
       setLoadText("os-load-15", currentSystem.load15, loadUnsupported);
       setText("os-network-rx-rate", optional(currentSystem.network_receive_bps, (value) => formatBytes(value) + "/s"));
       setText("os-network-tx-rate", optional(currentSystem.network_send_bps, (value) => formatBytes(value) + "/s"));
-      setText("http-rps", optional(http.rps, (value) => value.toFixed(2) + " req/s"));
-      setText("http-latency-p95", optional(latency.p95_ns, formatDurationNS));
-      setText("http-error-rate", optional(errorRate, ratio));
-      setText("http-in-flight", optional(http.in_flight, decimal.format));
-      setText("http-requests", optional(http.requests, decimal.format));
-      setText("http-latency-p50", optional(latency.p50_ns, formatDurationNS));
-      setText("http-latency-p99", optional(latency.p99_ns, formatDurationNS));
+      setText("kpi-qps", optional(selected.rps, (value) => value.toFixed(2)));
+      setText("kpi-in-flight", "In-flight " + optional(http.in_flight, decimal.format));
+      setText("kpi-requests", optional(selected.requests, integer.format));
+      setText("kpi-lifetime", "Lifetime " + optional(http.requests, integer.format));
+      setText("kpi-success", optional(successRate, ratio));
+      setText("kpi-error", optional(errorRate, ratio));
+      setText("kpi-p50", optional(latency.p50_ns, formatDurationNS));
+      setText("kpi-p95", optional(latency.p95_ns, formatDurationNS));
+      setText("kpi-p99", optional(latency.p99_ns, formatDurationNS));
+      setText("kpi-p999", optional(latency.p999_ns, formatDurationNS));
       setText("http-status-button", (currentHTTPStatus["4xx"] || currentHTTPStatus["5xx"]) ?
         "ERR " + integer.format((currentHTTPStatus["4xx"] || 0) + (currentHTTPStatus["5xx"] || 0)) :
-        "2xx " + integer.format(currentHTTPStatus["2xx"] || 0));
+        "OK " + integer.format((currentHTTPStatus["2xx"] || 0) + (currentHTTPStatus["3xx"] || 0)));
 
       renderHeapDetails();
       renderDiskDetails();
       renderHTTPStatusDetails();
+      renderStatusBars(currentHTTPStatus);
+      renderEndpoints(http.endpoints);
     }
 
     function setLoadText(id, value, unsupported) {
@@ -1192,9 +1753,6 @@
       const process = snapshot.process || {};
       const runtime = snapshot.runtime || {};
       const system = snapshot.system || {};
-      const http = snapshot.http || {};
-      const rates = http.rates || {};
-      const latency = http.latency || {};
       history.labels.push(new Date(snapshot.collected_at).toLocaleTimeString());
       history.processCPU.push(finite(process.cpu_percent) ? process.cpu_percent : null);
       history.systemCPU.push(finite(system.cpu_percent) ? system.cpu_percent : null);
@@ -1203,12 +1761,6 @@
       history.networkRX.push(finite(system.network_receive_bps) ? system.network_receive_bps : null);
       history.networkTX.push(finite(system.network_send_bps) ? system.network_send_bps : null);
       history.goroutines.push(finite(runtime.goroutines) ? runtime.goroutines : null);
-      history.rps.push(finite(http.rps) ? http.rps : null);
-      history.p50.push(finite(latency.p50_ns) ? latency.p50_ns : null);
-      history.p95.push(finite(latency.p95_ns) ? latency.p95_ns : null);
-      history.p99.push(finite(latency.p99_ns) ? latency.p99_ns : null);
-      history.error4xx.push(finite(rates["4xx"]) ? rates["4xx"] * 100 : null);
-      history.error5xx.push(finite(rates["5xx"]) ? rates["5xx"] * 100 : null);
       Object.values(history).forEach((values) => {
         while (values.length > MAX_SAMPLES) values.shift();
       });
@@ -1287,7 +1839,7 @@
     }
 
     function drawLineChart(canvas, seriesList, options) {
-      if (!canvas) return;
+      if (!canvas || canvas.clientWidth < 8) return;
       const context = canvas.getContext("2d");
       const dpr = window.devicePixelRatio || 1;
       const rect = canvas.getBoundingClientRect();
@@ -1311,7 +1863,7 @@
       }));
       canvas._chartMeta = {
         series: seriesList,
-        labels: visibleSamples(history.labels),
+        labels: Array.isArray(options.labels) ? options.labels : visibleSamples(history.labels),
         count: Math.max(0, ...seriesList.map((series) => series.data.length)),
         pad: padding,
         plotWidth: width - padding.left - padding.right,
@@ -1340,23 +1892,30 @@
       drawLineChart(byId("goroutine-chart"), [
         { name: "Count", data: visibleSamples(history.goroutines), color: accent }
       ], { minValue: 0, unit: "g" });
+      const slice = httpSlice();
+      const httpLabels = slice.map((sample) => {
+        const date = new Date((sample.t || 0) * 1000);
+        return Number.isNaN(date.getTime()) ? "Sample" : date.toLocaleTimeString();
+      });
       drawLineChart(byId("request-chart"), [
-        { name: "RPS", data: visibleSamples(history.rps), color: accent }
-      ], { minValue: 0, unit: "req/s" });
-      const p50 = visibleSamples(history.p50);
-      const p95 = visibleSamples(history.p95);
-      const p99 = visibleSamples(history.p99);
+        { name: "QPS", data: slice.map((sample) => finite(sample.requests) ? sample.requests : 0), color: accent }
+      ], { minValue: 0, unit: "req/s", labels: httpLabels });
+      const p50 = slice.map((sample) => finite(sample.p50_ns) ? sample.p50_ns : null);
+      const p95 = slice.map((sample) => finite(sample.p95_ns) ? sample.p95_ns : null);
+      const p99 = slice.map((sample) => finite(sample.p99_ns) ? sample.p99_ns : null);
+      const p999 = slice.map((sample) => finite(sample.p999_ns) ? sample.p999_ns : null);
       drawLineChart(byId("latency-chart"), [
-        { name: "P50", data: visibleSamples(fillForward(history.p50)), rawData: p50, color: accent },
-        { name: "P95", data: visibleSamples(fillForward(history.p95)), rawData: p95, color: warn, dash: [6, 4] },
-        { name: "P99", data: visibleSamples(fillForward(history.p99)), rawData: p99, color: bad }
-      ], { minValue: 0, formatValue: durationAxisNS, leftPadding: 70, idleWhenMissing: true });
-      const error4xx = visibleSamples(history.error4xx);
-      const error5xx = visibleSamples(history.error5xx);
+        { name: "P50", data: p50, color: accent },
+        { name: "P95", data: p95, color: good, dash: [4, 4] },
+        { name: "P99", data: p99, color: warn, dash: [6, 4] },
+        { name: "P999", data: p999, color: bad }
+      ], { minValue: 0, formatValue: durationAxisNS, leftPadding: 70, idleWhenMissing: true, labels: httpLabels });
+      const error4xx = slice.map((sample) => sample.requests > 0 ? statusCount(sample, "4xx") / sample.requests * 100 : null);
+      const error5xx = slice.map((sample) => sample.requests > 0 ? statusCount(sample, "5xx") / sample.requests * 100 : null);
       drawLineChart(byId("http-error-chart"), [
         { name: "4xx", data: fillZero(error4xx), rawData: error4xx, color: warn },
         { name: "5xx", data: fillZero(error5xx), rawData: error5xx, color: bad }
-      ], { minValue: 0, unit: "%", idleWhenMissing: true });
+      ], { minValue: 0, unit: "%", idleWhenMissing: true, labels: httpLabels });
     }
 
     function setupChartHover(canvas) {
@@ -1487,7 +2046,8 @@
         const snapshot = await response.json();
         const responseMS = performance.now() - started;
         renderMetrics(snapshot);
-        if (appendSample(snapshot)) drawCharts();
+        appendSample(snapshot);
+        drawCharts();
         hasUsableSnapshot = true;
         const partial = snapshot.collection && snapshot.collection.partial;
         updateState(partial ? "partial" : "live", responseMS, snapshot.collected_at);
@@ -1525,11 +2085,24 @@
     document.querySelectorAll(".sample-option").forEach((button) => {
       button.addEventListener("click", () => applySampleWindow(button.dataset.samples, true));
     });
+    document.querySelectorAll(".page-tab").forEach((button) => {
+      button.addEventListener("click", () => applyPage(button.dataset.page, true));
+    });
+    document.querySelectorAll(".endpoint-filter").forEach((button) => {
+      button.addEventListener("click", () => applyEndpointFilter(button.dataset.filter, true));
+    });
+    const savedEndpointFilter = storageGet("monitor.endpointFilter");
+    applyEndpointFilter(savedEndpointFilter || "all", false);
     byId("theme-toggle").addEventListener("click", toggleTheme);
     byId("page-scroll-dock").addEventListener("click", scrollUpQuarter);
 
     const savedSamples = storageGet("monitor.samples");
     applySampleWindow(savedSamples || "60", false);
+    const hashPage = location.hash === "#api" ? "api" : (location.hash === "#runtime" ? "runtime" : "");
+    applyPage(hashPage || storageGet("monitor.page") || "runtime", false);
+    window.addEventListener("hashchange", () => {
+      applyPage(location.hash === "#api" ? "api" : "runtime", false);
+    });
     const savedTheme = storageGet("monitor.theme");
     themeOverridden = savedTheme === "light" || savedTheme === "dark";
     applyTheme(themeOverridden ? savedTheme : "dark", false);

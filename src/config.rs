@@ -3,6 +3,9 @@ use std::time::Duration;
 /// Minimum supported dashboard refresh interval.
 pub const MIN_REFRESH: Duration = Duration::from_secs(1);
 
+/// In-process HTTP samples older than this are discarded.
+pub const HTTP_WINDOW: Duration = Duration::from_secs(60);
+
 const DEFAULT_TITLE: &str = "Axum Sentinel Monitor";
 const DEFAULT_DESCRIPTION: &str =
     "Live process, runtime, system, and HTTP metrics for this Axum service.";
@@ -57,6 +60,9 @@ impl Default for Config {
 impl Config {
     /// Minimum supported dashboard refresh interval.
     pub const MIN_REFRESH: Duration = Duration::from_secs(1);
+
+    /// In-process HTTP samples older than this are discarded.
+    pub const HTTP_WINDOW: Duration = Duration::from_secs(60);
 
     pub(crate) fn normalized(mut self) -> Self {
         if self.title.is_empty() {

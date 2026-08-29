@@ -6,17 +6,21 @@ real-time process, Tokio runtime, system, and HTTP metrics through a built-in
 dashboard and JSON snapshot.
 
 The dashboard is a dependency-free UI with the same layout, trend panels, and
-dark/light palette as the Fiber Monitor preview. It does not persist metrics,
-run a background collection loop, or replace Prometheus, OpenTelemetry, or an APM.
+dark/light palette as the Fiber Monitor preview. HTTP analytics stay in-process:
+no remote analytics service, Prometheus scrape, or other third-party backend is
+required. It does not persist metrics beyond the 60-second HTTP ring, run a
+background collection loop, or replace Prometheus, OpenTelemetry, or an APM.
 
 ## Features
 
 - Process CPU, RSS, threads, file descriptors/handles, and uptime
 - Tokio live tasks, worker count, and allocator heap details
 - System CPU, memory, application-filesystem usage, load averages, and network rates
-- HTTP requests, in-flight, 1xx–5xx classes, RPS, 4xx/5xx rates, and P50/P95/P99 latency
+- HTTP requests, in-flight, 1xx–5xx classes, and in-process QPS / P50 / P95 / P99 / P999
+- Per-route Endpoints list with in-flight, 30s/60s QPS, and P50 / P99 / P999
+- HTTP samples live in a 60-second ring (one slot per second); data older than 60s is discarded
 - Seven trend charts plus Heap, disk, and status-code detail views
-- Light/Dark toggle and a 30/60/90 sample window, persisted in local storage
+- Light/Dark toggle and a 30s/60s HTTP window, persisted in local storage
 - HTML dashboard or API-only operation
 - SIMD-accelerated JSON extraction and serialization through `sonic-rs`
 
@@ -95,15 +99,15 @@ requests are not included in HTTP metrics.
 | Process | CPU, RSS, threads, file descriptors/handles, runtime since monitor initialization |
 | Runtime | Tokio live tasks (`goroutines`), heap allocation/system/in-use/idle/released memory, worker count (`workers`) |
 | System | CPU, used/available/total memory, application-filesystem usage/type/free space, 1/5/15-minute load averages, aggregate network rates |
-| HTTP | Requests, in-flight requests, 1xx–5xx status classes, RPS, 4xx/5xx rates, P50/P95/P99 latency |
+| HTTP | Lifetime request/status totals, in-flight, 30s/60s QPS, 4xx/5xx rates, P50/P95/P99/P999, a 60-point 1s series, and per-route windows |
 
-Unsupported, failed, and not-yet-available window metrics are encoded as `null`,
-not as a synthetic zero. CPU, network, request-rate, status-rate, and latency
-values need two collection windows; their first snapshot is `null`.
+HTTP QPS and latency are computed inside the process from a 60-second ring. There is no Prometheus, SaaS analytics, or other remote backend. Slots older than `HTTP_WINDOW` (60 seconds) are overwritten. The dashboard has a **Runtime** tab (process/system) and an **API** tab (QPS, latency percentiles, error rate, status codes, and an Endpoints list). Each route is shown like a volume list: count, method, path, and a status-colored bar. In-flight calls use the same row. 30s/60s QPS, P50, P99, and P999 sit on the right. Numeric, UUID, and `{param}` path segments are collapsed to `:id`. At most 64 routes are retained. The API tab 30s/60s toggle shows the most recent 30 or 60 seconds of that ring. It does not keep more than 60 seconds, and it does not collect location, device, usage-time, or day-of-week dimensions.
+
+Unsupported, failed, and not-yet-available process/system window metrics are encoded as `null`,
+not as a synthetic zero. CPU and network rates need two collection windows; their first snapshot is `null`. HTTP QPS is `0` until the first completed request, and latency percentiles are `null` while the selected window has no samples.
 
 Snapshots are collected only when JSON is requested and are shared within the
-configured refresh TTL. The dashboard keeps at most 90 trend samples in browser
-memory and displays 60 by default.
+configured refresh TTL. Process/system trend charts keep at most 60 poll samples in the browser. HTTP charts are drawn from `http.series` (oldest-first, 60 one-second points) so a newly opened dashboard already shows the last minute.
 
 `runtime.goroutines` is the number of live Tokio tasks (or OS threads when no
 Tokio runtime is available). `runtime.workers` is the Tokio worker count. Rust
@@ -116,9 +120,9 @@ monitor route publicly without authentication or network-level access control.
 The crate sets `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`,
 but authorization remains the application's responsibility.
 
-Monitor records aggregate counters only. It does not collect request or response
+Monitor records aggregate counters and per-route 30s/60s windows, including in-flight. It does not collect request or response
 bodies, headers, cookies, query strings, client IPs, filesystem paths, or
-device names.
+device names. Numeric, UUID, and `{param}` path segments are stored as `:id`.
 
 ## Fiber Monitor compatibility
 

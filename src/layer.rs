@@ -6,6 +6,7 @@ use std::{
     time::Instant,
 };
 
+use axum::extract::MatchedPath;
 use axum::http::{Request, Response, StatusCode};
 use tower::{Layer, Service};
 
@@ -60,19 +61,37 @@ where
             return Box::pin(future);
         }
 
+        let method = request.method().as_str().to_owned();
+        let path = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(|matched| matched.as_str().to_owned())
+            .unwrap_or_else(|| request.uri().path().to_owned());
         let stats = Arc::clone(&self.stats);
-        let sequence = stats.http().begin_request();
+        let sequence = stats.http().begin_request(&method, &path);
         let started = Instant::now();
         let future = self.inner.call(request);
         Box::pin(async move {
-            let _guard = InFlightGuard(Arc::clone(&stats));
+            let _guard = InFlightGuard {
+                stats: Arc::clone(&stats),
+                method: method.clone(),
+                path: path.clone(),
+            };
             let result = future.await;
             let elapsed = started.elapsed();
             match &result {
-                Ok(response) => stats.http().finish(sequence, elapsed, response.status()),
-                Err(_) => stats
-                    .http()
-                    .finish(sequence, elapsed, StatusCode::INTERNAL_SERVER_ERROR),
+                Ok(response) => {
+                    stats
+                        .http()
+                        .finish(sequence, elapsed, response.status(), &method, &path)
+                }
+                Err(_) => stats.http().finish(
+                    sequence,
+                    elapsed,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &method,
+                    &path,
+                ),
             }
             result
         })

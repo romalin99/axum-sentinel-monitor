@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use axum::http::StatusCode;
 
 use crate::collect::Collector;
-use crate::histogram::LatencyHistogram;
+use crate::endpoints::EndpointSet;
+use crate::histogram::SlidingWindow;
 use crate::snapshot::Snapshot;
 
 pub(crate) struct SharedStats {
@@ -32,7 +33,8 @@ pub(crate) struct HttpMetrics {
     status3: AtomicU64,
     status4: AtomicU64,
     status5: AtomicU64,
-    latency: LatencyHistogram,
+    latency: SlidingWindow,
+    endpoints: EndpointSet,
 }
 
 impl SharedStats {
@@ -72,6 +74,8 @@ impl SharedStats {
 
 impl HttpMetrics {
     fn new() -> Self {
+        let latency = SlidingWindow::new();
+        let endpoints = EndpointSet::with_clock(latency.origin(), latency.extra_secs());
         Self {
             requests: AtomicU64::new(0),
             in_flight: AtomicU64::new(0),
@@ -80,20 +84,31 @@ impl HttpMetrics {
             status3: AtomicU64::new(0),
             status4: AtomicU64::new(0),
             status5: AtomicU64::new(0),
-            latency: LatencyHistogram::default(),
+            latency,
+            endpoints,
         }
     }
 
-    pub(crate) fn begin_request(&self) -> u64 {
+    pub(crate) fn begin_request(&self, method: &str, path: &str) -> u64 {
         let sequence = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         self.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.endpoints.begin(method, path);
         sequence
     }
 
-    pub(crate) fn finish(&self, sequence: u64, elapsed: Duration, status: StatusCode) {
+    pub(crate) fn finish(
+        &self,
+        _sequence: u64,
+        elapsed: Duration,
+        status: StatusCode,
+        method: &str,
+        path: &str,
+    ) {
         self.record_status(status);
         let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        self.latency.observe_sharded(ns, sequence);
+        let class = (status.as_u16() / 100) as u8;
+        self.latency.observe(ns, class);
+        self.endpoints.observe(method, path, ns, class);
     }
 
     fn record_status(&self, status: StatusCode) {
@@ -135,19 +150,28 @@ impl HttpMetrics {
         self.status5.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn latency(&self) -> &LatencyHistogram {
+    pub(crate) fn latency(&self) -> &SlidingWindow {
         &self.latency
     }
 
-    pub(crate) fn end_in_flight(&self) {
+    pub(crate) fn endpoints(&self) -> &EndpointSet {
+        &self.endpoints
+    }
+
+    pub(crate) fn end_in_flight(&self, method: &str, path: &str) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.endpoints.end(method, path);
     }
 }
 
-pub(crate) struct InFlightGuard(pub(crate) Arc<SharedStats>);
+pub(crate) struct InFlightGuard {
+    pub(crate) stats: Arc<SharedStats>,
+    pub(crate) method: String,
+    pub(crate) path: String,
+}
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.0.http.end_in_flight();
+        self.stats.http.end_in_flight(&self.method, &self.path);
     }
 }

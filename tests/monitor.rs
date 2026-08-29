@@ -1,14 +1,14 @@
 use std::time::Duration;
 
 use axum::{
-    body::Body,
-    http::{header, Request, StatusCode},
-    routing::get,
     Router,
+    body::Body,
+    http::{Request, StatusCode, header},
+    routing::get,
 };
 use axum_sentinel_monitor::{Config, Monitor};
 use http_body_util::BodyExt;
-use sonic_rs::{JsonValueTrait, Value};
+use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value};
 use tower::ServiceExt;
 
 async fn body(response: axum::response::Response) -> String {
@@ -37,12 +37,22 @@ async fn serves_default_and_custom_dashboard_safely() {
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let html = body(response).await;
     assert!(html.contains("Axum Sentinel Monitor"));
-    for metric in ["Process", "Runtime", "System", "HTTP", "Tasks"] {
+    for metric in ["Process", "Runtime", "System", "Tasks", "API", "QPS"] {
         assert!(html.contains(metric), "missing dashboard metric: {metric}");
     }
     assert!(html.contains("data-theme=\"dark\""));
     assert!(html.contains("canvas"));
     assert!(!html.contains("Chart.js"));
+    assert!(html.contains("data-page=\"api\""));
+    assert!(html.contains("Endpoints"));
+    assert!(html.contains("data-filter=\"success\""));
+    assert!(html.contains("endpoint-stats"));
+    assert!(html.contains(">P50<"));
+    assert!(html.contains(">P999<"));
+    assert!(html.contains(">30s<"));
+    assert!(!html.contains("data-samples=\"90\""));
+    assert!(!html.contains("Location"));
+    assert!(!html.contains("Day of week"));
     assert!(!html.contains("__MONITOR_TITLE__"));
     assert!(!html.contains("__MONITOR_REFRESH_MS__"));
 
@@ -86,9 +96,23 @@ async fn serves_documented_json_schema_with_accept_negotiation() {
     assert!(value["process"]["uptime_seconds"].is_number());
     assert!(value["runtime"]["goroutines"].is_number());
     assert!(value["runtime"]["workers"].is_number());
-    assert!(value["system"]["memory_total_bytes"].is_u64() || value["system"]["memory_total_bytes"].is_null());
-    assert!(value["http"]["requests"].is_u64());
+    assert!(
+        value["system"]["memory_total_bytes"].is_u64()
+            || value["system"]["memory_total_bytes"].is_null()
+    );
+    assert_eq!(value["http"]["requests"], 0);
+    assert!(value["http"]["in_flight"].is_u64());
     assert!(value["http"]["status"]["2xx"].is_u64());
+    assert_eq!(value["http"]["window_seconds"], 60);
+    assert_eq!(
+        value["http"]["series"].as_array().map(|rows| rows.len()),
+        Some(60)
+    );
+    assert_eq!(value["http"]["windows"]["30"]["seconds"], 30);
+    assert_eq!(value["http"]["windows"]["60"]["seconds"], 60);
+    assert!(value["http"]["windows"]["60"]["status"].is_object());
+    assert!(value["http"]["endpoints"].is_array());
+    assert!(value["http"]["latency"].is_object());
     assert!(value["collected_at"].is_str());
     assert!(value["collection"]["errors"].is_array());
 }

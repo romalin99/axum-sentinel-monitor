@@ -2,8 +2,8 @@
 name = "axum-sentinel-monitor"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.90"
-description = "An embeddable real-time system monitor for Axum"
+rust-version = "1.95"
+description = "A Fiber Monitor-style runtime dashboard for Axum"
 license = "MIT"
 repository = "https://github.com/romalin99/axum-sentinel-monitor"
 keywords = ["axum", "monitoring", "dashboard", "metrics"]
@@ -11,13 +11,15 @@ categories = ["web-programming", "development-tools::profiling"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
-netstat2 = "0.11"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+num_threads = "0.1"
 serde = { version = "1", features = ["derive"] }
 sonic-rs = "0.5"
-sysinfo = "0.37"
+sysinfo = "0.39"
+tokio = { version = "1", default-features = false, features = ["rt"] }
 tower = "0.5"
 
 [dev-dependencies]
 http-body-util = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 tower = { version = "0.5", features = ["util"] }

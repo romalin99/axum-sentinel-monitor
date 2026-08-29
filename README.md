@@ -1,42 +1,33 @@
-# Axum Sentinel Monitor
+# axum-sentinel-monitor
 
-An embeddable, real-time system dashboard for [Axum](https://github.com/tokio-rs/axum).
-It follows the feature set of Fiber v3 Monitor while using instance-local state and
-normal Tower/Axum composition.
+An embeddable Axum runtime monitor inspired by
+[Fiber Monitor v3](https://docs.gofiber.io/contrib/monitor/). It exposes
+real-time process, Tokio runtime, system, and HTTP metrics through a built-in
+dashboard and JSON snapshot.
+
+The dashboard is a dependency-free UI with the same layout, trend panels, and
+dark/light palette as the Fiber Monitor preview. It does not persist metrics,
+run a background collection loop, or replace Prometheus, OpenTelemetry, or an APM.
 
 ## Features
 
-- One route serves an HTML dashboard or JSON, selected with `Accept: application/json`
-- Process CPU, RSS, TCP connections, thread/task count, uptime and request count
-- Host CPU, used/total memory, one-minute load average and TCP connections
-- CPU, memory, browser-observed response time, connections, requests and threads charts
-- Configurable refresh interval, title, font URL, Chart.js URL and trusted custom head HTML
+- Process CPU, RSS, threads, file descriptors/handles, and uptime
+- Tokio live tasks, worker count, and allocator heap details
+- System CPU, memory, application-filesystem usage, load averages, and network rates
+- HTTP requests, in-flight, 1xx–5xx classes, RPS, 4xx/5xx rates, and P50/P95/P99 latency
+- Seven trend charts plus Heap, disk, and status-code detail views
+- Light/Dark toggle and a 30/60/90 sample window, persisted in local storage
+- HTML dashboard or API-only operation
 - SIMD-accelerated JSON extraction and serialization through `sonic-rs`
-- Isolated monitor instances, graceful metric degradation and an explicit collector shutdown
-- No WebSocket, SSE, persistence or telemetry export; updates use ordinary HTTP polling
 
-## Fiber v3 correspondence
+## Usage
 
-This crate follows the current
-[Fiber v3 monitor](https://docs.gofiber.io/contrib/monitor/) metric and dashboard model:
-
-- Fiber's six charts map to process/OS CPU, process/OS/total memory, browser-observed
-  response time, process/OS TCP connections, request delta, and goroutine/thread count.
-- The browser polls at `refresh - 200ms`, with a 200ms floor, and retains the latest
-  51 points. Chart labels use real timestamps, as in Fiber v3.
-- `pid.requests` stays a decimal string. The browser uses `BigInt`, clamps the delta to
-  JavaScript's safe integer range, and treats a negative delta as a process restart.
-- Fiber's process/OS/total memory presentation and 1024-based `formatBytes` display are
-  retained. Chart values follow Fiber v3's decimal-MB convention.
-- `uptime` is shown separately from the six charts, matching the Fiber v3 page structure.
-
-Intentional Axum differences are annotated in the implementation: `MonitorLayer` replaces
-Fiber's app-wide middleware plus `Next`, each monitor owns isolated state instead of Fiber's
-package singleton, content negotiation accepts normal weighted `Accept` headers, and
-configuration values are escaped before insertion into HTML. Fiber's goroutine value maps
-to the process thread/task count available on the current platform.
-
-## Quick start
+```toml
+[dependencies]
+axum = "0.8"
+axum-sentinel-monitor = "0.1"
+tokio = { version = "1", features = ["full"] }
+```
 
 ```rust
 use axum::{Router, routing::get};
@@ -44,205 +35,100 @@ use axum_sentinel_monitor::{Config, Monitor};
 
 #[tokio::main]
 async fn main() {
-    let monitor = Monitor::new(Config::default());
+    let monitor = Monitor::new(Config {
+        title: "My Service".into(),
+        description: "Live runtime and HTTP statistics.".into(),
+        ..Config::default()
+    });
+
     let app = Router::new()
-        .route("/", get(|| async { "hello" }))
-        .nest("/monitor", monitor.router())
+        .route("/", get(|| async { "ok" }))
+        .merge(monitor.router())
+        // Apply last so every application route is recorded. The monitor
+        // path itself is skipped.
         .layer(monitor.layer());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 ```
 
-Run the included example with `cargo run --example basic`, then open
-`http://127.0.0.1:3000/monitor`.
-
-`monitor.layer()` counts requests passing through that layer. Move the layer onto a
-sub-router if only part of the application should be counted. The monitor route itself is
-counted in the example because the layer wraps the complete application.
-
-## Example traffic endpoints
-
-The basic example exposes two JSON endpoints for generating monitored requests.
-
-### Search
-
-```http
-GET /search?name=Tom&age=18
-```
-
-Both query parameters are required. The response appends `你好` to `name` and increments
-`age` with saturating `u32` arithmetic:
+Open <http://127.0.0.1:3000/metrics>. Request the same endpoint with
+`Accept: application/json` to receive the current snapshot:
 
 ```json
 {
-  "name": "Tom你好",
-  "age": 19
+  "collected_at": "2026-08-29T00:00:00Z",
+  "collection": { "partial": false, "errors": [] },
+  "process": {},
+  "runtime": {},
+  "system": {},
+  "http": {}
 }
 ```
 
-Test it with:
-
-```sh
-curl 'http://127.0.0.1:3000/search?name=Tom&age=18'
-```
-
-### Create user
-
-```http
-POST /user
-Content-Type: application/json
-```
-
-Request body:
-
-```json
-{
-  "name": "Alice",
-  "age": 20
-}
-```
-
-Response:
-
-```json
-{
-  "id": 1,
-  "name": "Alice",
-  "age": 20
-}
-```
-
-`id` is a process-local incrementing `u64` and resets when the example restarts.
-
-```sh
-curl -X POST 'http://127.0.0.1:3000/user' \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"Alice","age":20}'
-```
-
-These requests increase the monitor's total/request-delta counters. The Response Time
-chart still measures the browser's polling request to `/monitor`, matching Fiber v3.
+A route-only mount still serves the dashboard and JSON snapshot, but application
+HTTP metrics stay empty until `Monitor::layer()` is applied. Monitor endpoint
+requests are not included in HTTP metrics.
 
 ## Configuration
 
-| Field | Default | Notes |
+| Field | Default | Description |
 | --- | --- | --- |
-| `title` | `Axum Sentinel Monitor` | Empty values use the default; HTML escaped |
-| `refresh` | 3 seconds | Values below 200ms are raised to 200ms |
-| `api_only` | `false` | Always return JSON when enabled |
-| `font_url` | Google Fonts Roboto | Empty disables the stylesheet |
-| `chart_js_url` | Chart.js 2.9 on jsDelivr | Empty disables charts |
-| `custom_head` | empty | Inserted as raw HTML; trusted application configuration only |
+| `title` | `Axum Sentinel Monitor` | Document title and dashboard heading |
+| `description` | Live process, runtime, system, and HTTP metrics… | Text below the heading |
+| `footer` | `Powered by axum-sentinel-monitor.` | Footer text |
+| `favicon_url` | Built-in SVG | Root-relative path or absolute HTTP(S) URL |
+| `refresh` | 3 seconds | Browser polling interval and snapshot cache TTL; values below 1s are clamped |
+| `api_only` | `false` | Always return JSON |
+| `custom_head` | empty | Deprecated; ignored by the embedded dashboard |
+| `font_url` | Google Fonts Roboto | Deprecated; no external font is loaded |
+| `chart_js_url` | Chart.js 2.9 CDN | Deprecated; charts use the built-in Canvas implementation |
+| `route` | `/metrics` | Route created by `Monitor::router()` |
 
-The default page loads two third-party resources. For an offline or stricter deployment,
-host them yourself and set the two URLs, or set them to empty strings. Inline CSS and
-JavaScript mean that a strict Content Security Policy must allow the page explicitly.
+## Metrics
 
-## JSON API
+| Group | Metrics |
+| --- | --- |
+| Process | CPU, RSS, threads, file descriptors/handles, runtime since monitor initialization |
+| Runtime | Tokio live tasks (`goroutines`), heap allocation/system/in-use/idle/released memory, worker count (`workers`) |
+| System | CPU, used/available/total memory, application-filesystem usage/type/free space, 1/5/15-minute load averages, aggregate network rates |
+| HTTP | Requests, in-flight requests, 1xx–5xx status classes, RPS, 4xx/5xx rates, P50/P95/P99 latency |
 
-Send `Accept: application/json` to the mounted monitor URL:
+Unsupported, failed, and not-yet-available window metrics are encoded as `null`,
+not as a synthetic zero. CPU, network, request-rate, status-rate, and latency
+values need two collection windows; their first snapshot is `null`.
 
-```json
-{
-  "pid": {
-    "cpu": 0.0,
-    "ram": 0,
-    "conns": 0,
-    "goroutines": 0,
-    "requests": "42",
-    "uptime": 12
-  },
-  "os": {
-    "cpu": 0.0,
-    "ram": 0,
-    "total_ram": 0,
-    "load_avg": 0.0,
-    "conns": 0
-  }
-}
-```
+Snapshots are collected only when JSON is requested and are shared within the
+configured refresh TTL. The dashboard keeps at most 90 trend samples in browser
+memory and displays 60 by default.
 
-`requests` is a decimal string so JavaScript does not lose 64-bit integer precision.
-Response time is measured in the browser around the polling request, matching Fiber
-Monitor; it is not server handler latency. The headline shows the raw latest value while
-the chart uses an EWMA (`alpha = 0.2`) to reduce browser scheduling jitter. Request chart
-points are counts since the prior poll, not requests per second.
-
-### JSON implementation
-
-The monitor API and example request handlers use the public `SonicJson<T>` extractor and
-response wrapper, backed by [`sonic-rs`](https://github.com/cloudwego/sonic-rs). Axum's
-`json` feature is disabled, so `serde_json` is not present in the dependency graph.
-
-```rust
-use axum_sentinel_monitor::SonicJson;
-use serde::{Deserialize, Serialize};
-
-#[derive(Deserialize)]
-struct Input {
-    name: String,
-}
-
-#[derive(Serialize)]
-struct Output {
-    message: String,
-}
-
-async fn handler(SonicJson(input): SonicJson<Input>) -> SonicJson<Output> {
-    SonicJson(Output {
-        message: format!("hello {}", input.name),
-    })
-}
-```
-
-The extractor accepts `application/json` and `application/*+json`. Missing or unsupported
-content types return `415`; malformed JSON returns `400`.
+`runtime.goroutines` is the number of live Tokio tasks (or OS threads when no
+Tokio runtime is available). `runtime.workers` is the Tokio worker count. Rust
+has no garbage collector, so GC metrics are not collected or shown.
 
 ## Security
 
-The endpoint reveals process and host information. It has no built-in authentication so it
-can compose with the authorization middleware already used by an application. Mount it on
-an internal listener or wrap the monitor router in an authentication layer before exposing
-it. Do not accept `custom_head` from users.
+Runtime metrics can reveal process and host information. Do not expose the
+monitor route publicly without authentication or network-level access control.
+The crate sets `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`,
+but authorization remains the application's responsibility.
 
-For example, apply your existing authentication middleware only to the monitor router:
+Monitor records aggregate counters only. It does not collect request or response
+bodies, headers, cookies, query strings, client IPs, filesystem paths, or
+device names.
 
-```rust,ignore
-let protected_monitor = monitor
-    .router()
-    .route_layer(axum::middleware::from_fn(require_admin));
-let app = Router::new().nest("/monitor", protected_monitor);
-```
+## Fiber Monitor compatibility
 
-For infrastructure-only access, serve `monitor.router()` from a second listener bound to a
-private interface instead of adding it to the public application router.
+The dashboard layout, colors, trend panels, and JSON groups match
+[Fiber Monitor v3](https://github.com/gofiber/contrib/tree/main/v3/monitor).
+Axum routing and middleware are separate, so this crate uses:
 
-Responses include `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
-Configuration values used in text and URL attributes are escaped.
+- `Monitor::router()` to expose the dashboard/API route
+- `Monitor::layer()` to record application HTTP metrics
 
-## Platform behavior
+## License
 
-The collector targets Linux, macOS and Windows. Some operating systems, containers and
-sandboxes deny process details or TCP socket enumeration. Failed samples retain the latest
-successful value (or zero before the first success) and never make the HTTP endpoint fail.
-Host values reflect what the operating system exposes and are not necessarily container
-resource limits.
-
-Fiber's `goroutines` field is represented as the current Rust process thread/task count.
-Unlike Fiber's package-global collector, each `Monitor` has its own refresh interval and
-request count. Call `monitor.close()` for explicit early shutdown; otherwise the sampler
-ends after the final instance clone is dropped.
-
-## Development
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-```
-
-This project is independently implemented with reference to
-`github.com/gofiber/contrib/v3/monitor` v1.1.1. See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Licensed under the MIT license.

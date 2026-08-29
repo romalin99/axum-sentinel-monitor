@@ -1,15 +1,21 @@
 use std::{
+    io::ErrorKind,
+    net::SocketAddr,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use axum::{
-    Router,
     extract::Query,
+    http::StatusCode,
     routing::{get, post},
+    Router,
 };
 use axum_sentinel_monitor::{Config, Monitor, SonicJson};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::sleep;
 
 static NEXT_USER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -56,7 +62,10 @@ async fn create_user(SonicJson(input): SonicJson<CreateUser>) -> SonicJson<User>
 #[tokio::main]
 async fn main() {
     let monitor = Monitor::new(Config {
-        title: "Example Service".to_owned(),
+        title: "Axum Sentinel Monitor".into(),
+        description: "Live process, runtime, system, and HTTP metrics for this Axum service."
+            .into(),
+        footer: "Powered by axum-sentinel-monitor.".into(),
         refresh: Duration::from_secs(2),
         ..Config::default()
     });
@@ -65,17 +74,58 @@ async fn main() {
         .route("/", get(|| async { "Hello from Axum" }))
         .route("/search", get(search))
         .route("/user", post(create_user))
-        .nest("/monitor", monitor.router())
+        .route(
+            "/slow",
+            get(|| async {
+                sleep(Duration::from_millis(40)).await;
+                "slow"
+            }),
+        )
+        .route(
+            "/work",
+            get(|| async {
+                sleep(Duration::from_millis(8)).await;
+                "work"
+            }),
+        )
+        .route("/client-error", get(|| async { StatusCode::BAD_REQUEST }))
+        .route("/fail", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
+        .merge(monitor.router())
         .layer(monitor.layer());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    let address = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let listener = tokio::net::TcpListener::bind(address)
         .await
         .expect("bind server");
-    println!("app: http://127.0.0.1:3000");
-    println!("monitor: http://127.0.0.1:3000/monitor");
-    println!("search: http://127.0.0.1:3000/search?name=Tom&age=18");
-    println!("create user: POST http://127.0.0.1:3000/user");
+    println!("app: http://{address}");
+    println!("monitor: http://{address}/metrics");
+    println!("search: http://{address}/search?name=Tom&age=18");
+    println!("create user: POST http://{address}/user");
+    tokio::spawn(generate_traffic(address));
     axum::serve(listener, app).await.expect("serve app");
+}
+
+async fn generate_traffic(address: SocketAddr) {
+    sleep(Duration::from_millis(250)).await;
+    let paths = ["/", "/work", "/work", "/slow", "/client-error", "/fail"];
+    loop {
+        for path in paths {
+            let _ = http_get(address, path).await;
+            sleep(Duration::from_millis(180)).await;
+        }
+    }
+}
+
+async fn http_get(address: SocketAddr, path: &str) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect(address).await?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    let mut buf = [0u8; 256];
+    match stream.read(&mut buf).await {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::ConnectionReset => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -83,10 +133,10 @@ mod tests {
     use super::*;
     use axum::{
         body::Body,
-        http::{Request, StatusCode, header},
+        http::{header, Request, StatusCode},
     };
     use http_body_util::BodyExt;
-    use sonic_rs::{JsonValueTrait, Value, json};
+    use sonic_rs::{json, JsonValueTrait, Value};
     use tower::ServiceExt;
 
     async fn json_body(response: axum::response::Response) -> Value {

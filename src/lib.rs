@@ -212,7 +212,7 @@ mod tests {
         let monitor = Monitor::default();
         let response = monitor
             .router()
-            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/monitor").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -244,7 +244,7 @@ mod tests {
 
         let response = app
             .oneshot(
-                Request::get("/metrics")
+                Request::get("/monitor")
                     .header(ACCEPT, "application/json")
                     .body(Body::empty())
                     .unwrap(),
@@ -269,7 +269,7 @@ mod tests {
         let app = monitor.router().layer(monitor.layer());
         let response = app
             .oneshot(
-                Request::get("/metrics")
+                Request::get("/monitor")
                     .header(ACCEPT, "application/json")
                     .body(Body::empty())
                     .unwrap(),
@@ -285,7 +285,7 @@ mod tests {
     async fn rejects_non_get_requests() {
         let response = Monitor::default()
             .router()
-            .oneshot(Request::post("/metrics").body(Body::empty()).unwrap())
+            .oneshot(Request::post("/monitor").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);

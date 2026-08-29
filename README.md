@@ -55,7 +55,7 @@ async fn main() {
 }
 ```
 
-Open <http://127.0.0.1:3000/metrics>. Request the same endpoint with
+Open <http://127.0.0.1:3000/monitor>. Request the same endpoint with
 `Accept: application/json` to receive the current snapshot:
 
 ```json
@@ -86,7 +86,7 @@ requests are not included in HTTP metrics.
 | `custom_head` | empty | Deprecated; ignored by the embedded dashboard |
 | `font_url` | Google Fonts Roboto | Deprecated; no external font is loaded |
 | `chart_js_url` | Chart.js 2.9 CDN | Deprecated; charts use the built-in Canvas implementation |
-| `route` | `/metrics` | Route created by `Monitor::router()` |
+| `route` | `/monitor` | Route created by `Monitor::router()` |
 
 ## Metrics
 

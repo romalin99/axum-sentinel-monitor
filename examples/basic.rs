@@ -98,7 +98,7 @@ async fn main() {
         .await
         .expect("bind server");
     println!("app: http://{address}");
-    println!("monitor: http://{address}/metrics");
+    println!("monitor: http://{address}/monitor");
     println!("search: http://{address}/search?name=Tom&age=18");
     println!("create user: POST http://{address}/user");
     tokio::spawn(generate_traffic(address));

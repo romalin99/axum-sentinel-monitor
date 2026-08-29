@@ -49,7 +49,7 @@ impl Default for Config {
             custom_head: String::new(),
             font_url: LEGACY_FONT_URL.into(),
             chart_js_url: LEGACY_CHART_JS_URL.into(),
-            route: "/metrics".into(),
+            route: "/monitor".into(),
         }
     }
 }
@@ -78,7 +78,7 @@ impl Config {
             self.favicon_url.clear();
         }
         if self.route.is_empty() {
-            self.route = "/metrics".into();
+            self.route = "/monitor".into();
         } else if !self.route.starts_with('/') {
             self.route.insert(0, '/');
         }

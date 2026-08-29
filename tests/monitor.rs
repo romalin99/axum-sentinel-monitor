@@ -26,7 +26,7 @@ async fn serves_default_and_custom_dashboard_safely() {
     let default = Monitor::default();
     let response = default
         .router()
-        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/monitor").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -53,7 +53,7 @@ async fn serves_default_and_custom_dashboard_safely() {
     });
     let response = custom
         .router()
-        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/monitor").body(Body::empty()).unwrap())
         .await
         .unwrap();
     let html = body(response).await;
@@ -68,7 +68,7 @@ async fn serves_documented_json_schema_with_accept_negotiation() {
     let response = monitor
         .router()
         .oneshot(
-            Request::get("/metrics")
+            Request::get("/monitor")
                 .header(
                     header::ACCEPT,
                     "text/html;q=0.4, application/json; charset=utf-8; q=0.9",
@@ -101,7 +101,7 @@ async fn supports_api_only_and_rejects_every_non_get_method() {
     });
     let response = monitor
         .router()
-        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/monitor").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(
@@ -111,7 +111,7 @@ async fn supports_api_only_and_rejects_every_non_get_method() {
 
     let response = monitor
         .router()
-        .oneshot(Request::post("/metrics").body(Body::empty()).unwrap())
+        .oneshot(Request::post("/monitor").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
@@ -144,7 +144,7 @@ async fn monitor_endpoint_is_not_application_traffic() {
     let app = monitor.router().layer(monitor.layer());
     let response = app
         .oneshot(
-            Request::get("/metrics")
+            Request::get("/monitor")
                 .header(header::ACCEPT, "application/json")
                 .body(Body::empty())
                 .unwrap(),

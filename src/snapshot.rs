@@ -63,10 +63,61 @@ pub struct SystemStats {
 pub struct HttpStats {
     pub requests: u64,
     pub in_flight: u64,
+    /// Requests per second over the last 60 seconds of in-process samples.
     pub rps: Option<f64>,
     pub status: HttpStatusStats,
     pub rates: HttpRateStats,
     pub latency: LatencyStats,
+    /// Maximum HTTP sample retention, in seconds. Older slots are discarded.
+    pub window_seconds: u32,
+    pub windows: HttpWindows,
+    /// One point per second for the retained window, oldest first.
+    pub series: Vec<HttpSecondSample>,
+    /// Per-route 30s/60s stats, in-flight first then busiest. Samples older than 60s are dropped.
+    pub endpoints: Vec<HttpEndpointStats>,
+}
+
+/// Method + path traffic for the same 30s/60s ring as [`HttpStats`].
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct HttpEndpointStats {
+    pub method: String,
+    pub path: String,
+    /// Requests currently being handled for this route.
+    pub in_flight: u64,
+    pub windows: HttpWindows,
+}
+
+/// 30-second and 60-second views of the same in-process ring.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct HttpWindows {
+    #[serde(rename = "30")]
+    pub secs_30: HttpWindowStats,
+    #[serde(rename = "60")]
+    pub secs_60: HttpWindowStats,
+}
+
+/// Aggregated HTTP traffic for a sliding window that never exceeds 60 seconds.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct HttpWindowStats {
+    pub seconds: u32,
+    pub covered_seconds: u32,
+    pub requests: u64,
+    pub rps: f64,
+    pub status: HttpStatusStats,
+    pub rates: HttpRateStats,
+    pub latency: LatencyStats,
+}
+
+/// Completed requests in a single one-second slot.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct HttpSecondSample {
+    pub t: i64,
+    pub requests: u64,
+    pub status: HttpStatusStats,
+    pub p50_ns: Option<u64>,
+    pub p95_ns: Option<u64>,
+    pub p99_ns: Option<u64>,
+    pub p999_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -96,10 +147,5 @@ pub struct LatencyStats {
     pub p50_ns: Option<u64>,
     pub p95_ns: Option<u64>,
     pub p99_ns: Option<u64>,
-}
-
-impl HttpStatusStats {
-    pub(crate) fn completed(&self) -> u64 {
-        self.status_1xx + self.status_2xx + self.status_3xx + self.status_4xx + self.status_5xx
-    }
+    pub p999_ns: Option<u64>,
 }

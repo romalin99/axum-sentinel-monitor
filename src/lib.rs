@@ -2,11 +2,15 @@
 //!
 //! [`Monitor::router`] serves an HTML dashboard (or JSON when requested), while
 //! [`Monitor::layer`] records HTTP metrics for application traffic. Requests to
-//! the monitor endpoint itself are not counted.
+//! the monitor endpoint itself are not counted. HTTP QPS and latency percentiles
+//! are computed in-process from a 60-second ring; samples older than
+//! [`HTTP_WINDOW`] are discarded. The dashboard API tab also lists per-route
+//! in-flight calls plus 30s/60s QPS and P50/P95/P99/P999.
 
 mod collect;
 mod config;
 mod dashboard;
+mod endpoints;
 mod histogram;
 mod json;
 mod layer;
@@ -16,21 +20,22 @@ mod stats;
 use std::sync::Arc;
 
 use axum::{
+    Router,
     http::{
-        header::{ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE},
         HeaderMap, HeaderValue, Method, StatusCode,
+        header::{ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE},
     },
     response::{Html, IntoResponse, Response},
     routing::any,
-    Router,
 };
 
-pub use config::{Config, MIN_REFRESH};
+pub use config::{Config, HTTP_WINDOW, MIN_REFRESH};
 pub use json::{SonicJson, SonicJsonRejection};
 pub use layer::{MonitorLayer, MonitorService};
 pub use snapshot::{
-    CollectionStats, HttpRateStats, HttpStats, HttpStatusStats, LatencyStats, ProcessStats,
-    RuntimeStats, Snapshot, SystemStats,
+    CollectionStats, HttpEndpointStats, HttpRateStats, HttpSecondSample, HttpStats,
+    HttpStatusStats, HttpWindowStats, HttpWindows, LatencyStats, ProcessStats, RuntimeStats,
+    Snapshot, SystemStats,
 };
 
 /// Shared monitor handle used to create the endpoint and request-counting layer.
@@ -134,10 +139,7 @@ impl Monitor {
 }
 
 fn prefers_json(headers: &HeaderMap) -> bool {
-    let Some(accept) = headers
-        .get(ACCEPT)
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(accept) = headers.get(ACCEPT).and_then(|value| value.to_str().ok()) else {
         return false;
     };
     let ranges = parse_accept(accept);
@@ -202,7 +204,7 @@ mod tests {
         routing::get,
     };
     use http_body_util::BodyExt;
-    use sonic_rs::JsonValueTrait;
+    use sonic_rs::{JsonContainerTrait, JsonValueTrait};
     use tower::ServiceExt;
 
     use super::*;
@@ -226,6 +228,10 @@ mod tests {
         assert!(html.contains("--accent: #67e8f9"));
         assert!(html.contains("canvas"));
         assert!(!html.contains("Chart.js"));
+        assert!(html.contains("P999"));
+        assert!(html.contains("data-page=\"api\""));
+        assert!(html.contains("Endpoints"));
+        assert!(!html.contains("data-samples=\"90\""));
     }
 
     #[tokio::test]
@@ -257,10 +263,130 @@ mod tests {
         let value: sonic_rs::Value = sonic_rs::from_slice(&body).unwrap();
         assert_eq!(value["http"]["requests"], 1);
         assert_eq!(value["http"]["status"]["2xx"], 1);
+        assert_eq!(value["http"]["window_seconds"], 60);
+        assert_eq!(
+            value["http"]["series"].as_array().map(|rows| rows.len()),
+            Some(60)
+        );
+        assert_eq!(value["http"]["windows"]["60"]["requests"], 1);
+        assert_eq!(value["http"]["windows"]["60"]["status"]["2xx"], 1);
+        assert_eq!(value["http"]["endpoints"][0]["path"], "/");
+        assert_eq!(value["http"]["endpoints"][0]["method"], "GET");
+        assert_eq!(value["http"]["endpoints"][0]["in_flight"], 0);
+        assert_eq!(
+            value["http"]["endpoints"][0]["windows"]["60"]["requests"],
+            1
+        );
+        assert!(value["http"]["latency"]["p50_ns"].is_u64());
+        assert!(value["http"]["latency"]["p95_ns"].is_u64());
+        assert!(value["http"]["latency"]["p999_ns"].is_u64());
+        assert!(value["http"]["rps"].is_number());
         assert!(value["process"]["uptime_seconds"].is_u64());
         assert!(value["runtime"]["goroutines"].is_u64());
         assert!(value["collected_at"].is_str());
         assert!(value["collection"]["errors"].is_array());
+    }
+
+    #[tokio::test]
+    async fn sorts_endpoints_by_recent_request_count() {
+        let monitor = Monitor::default();
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route("/work", get(|| async { "work" }))
+            .route("/fail", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
+            .route("/items/{id}", get(|| async { "item" }))
+            .merge(monitor.router())
+            .layer(monitor.layer());
+
+        for _ in 0..3 {
+            let _ = app
+                .clone()
+                .oneshot(Request::get("/work").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+        }
+        let _ = app
+            .clone()
+            .oneshot(Request::get("/fail").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let _ = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let _ = app
+            .clone()
+            .oneshot(Request::get("/items/42").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get("/monitor")
+                    .header(ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: sonic_rs::Value = sonic_rs::from_slice(&body).unwrap();
+        let endpoints = value["http"]["endpoints"].as_array().expect("endpoints");
+        assert!(endpoints.len() >= 3);
+        assert_eq!(endpoints[0]["method"], "GET");
+        assert_eq!(endpoints[0]["path"], "/work");
+        assert_eq!(endpoints[0]["windows"]["60"]["requests"], 3);
+        assert_eq!(endpoints[0]["in_flight"], 0);
+        assert!(endpoints[0]["windows"]["60"]["latency"]["p50_ns"].is_u64());
+        assert!(endpoints[0]["windows"]["30"]["rps"].is_number());
+        let fail = endpoints
+            .iter()
+            .find(|row| row["path"] == "/fail")
+            .expect("fail endpoint");
+        assert_eq!(fail["windows"]["60"]["status"]["5xx"], 1);
+        let item = endpoints
+            .iter()
+            .find(|row| row["path"] == "/items/:id")
+            .expect("collapsed item path");
+        assert_eq!(item["windows"]["60"]["requests"], 1);
+    }
+
+    #[tokio::test]
+    async fn records_in_flight_per_endpoint() {
+        let monitor = Monitor::default();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let started_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        let app = Router::new()
+            .route("/hold", {
+                let started_tx = std::sync::Arc::clone(&started_tx);
+                get(move || {
+                    let started_tx = std::sync::Arc::clone(&started_tx);
+                    async move {
+                        if let Some(tx) = started_tx.lock().ok().and_then(|mut slot| slot.take()) {
+                            let _ = tx.send(());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        "held"
+                    }
+                })
+            })
+            .merge(monitor.router())
+            .layer(monitor.layer());
+
+        let pending = tokio::spawn(app.oneshot(Request::get("/hold").body(Body::empty()).unwrap()));
+        started_rx.await.expect("handler started");
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.http.in_flight, 1);
+        let hold = snapshot
+            .http
+            .endpoints
+            .iter()
+            .find(|row| row.path == "/hold")
+            .expect("hold endpoint");
+        assert_eq!(hold.method, "GET");
+        assert_eq!(hold.in_flight, 1);
+        pending.abort();
     }
 
     #[tokio::test]

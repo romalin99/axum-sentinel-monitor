@@ -6,10 +6,10 @@ use std::{
 };
 
 use axum::{
+    Router,
     extract::Query,
     http::StatusCode,
     routing::{get, post},
-    Router,
 };
 use axum_sentinel_monitor::{Config, Monitor, SonicJson};
 use serde::{Deserialize, Serialize};
@@ -89,7 +89,16 @@ async fn main() {
             }),
         )
         .route("/client-error", get(|| async { StatusCode::BAD_REQUEST }))
+        .route("/old", get(|| async { StatusCode::TEMPORARY_REDIRECT }))
         .route("/fail", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
+        .route("/items/{id}", get(|| async { "item" }))
+        .route(
+            "/hold",
+            get(|| async {
+                sleep(Duration::from_millis(1800)).await;
+                "hold"
+            }),
+        )
         .merge(monitor.router())
         .layer(monitor.layer());
 
@@ -107,18 +116,54 @@ async fn main() {
 
 async fn generate_traffic(address: SocketAddr) {
     sleep(Duration::from_millis(250)).await;
-    let paths = ["/", "/work", "/work", "/slow", "/client-error", "/fail"];
+    let paths = [
+        "/",
+        "/work",
+        "/work",
+        "/slow",
+        "/search?name=Tom&age=18",
+        "/items/1",
+        "/items/2",
+        "/old",
+        "/client-error",
+        "/fail",
+    ];
     loop {
         for path in paths {
             let _ = http_get(address, path).await;
             sleep(Duration::from_millis(180)).await;
         }
+        let _ = http_post_user(address).await;
+        let hold_address = address;
+        tokio::spawn(async move {
+            let _ = http_get(hold_address, "/hold").await;
+        });
+        sleep(Duration::from_millis(180)).await;
     }
 }
 
 async fn http_get(address: SocketAddr, path: &str) -> std::io::Result<()> {
+    raw_http(
+        address,
+        &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+    )
+    .await
+}
+
+async fn http_post_user(address: SocketAddr) -> std::io::Result<()> {
+    let body = r#"{"name":"Alice","age":20}"#;
+    raw_http(
+        address,
+        &format!(
+            "POST /user HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await
+}
+
+async fn raw_http(address: SocketAddr, request: &str) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(address).await?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
     let mut buf = [0u8; 256];
     match stream.read(&mut buf).await {
@@ -133,10 +178,10 @@ mod tests {
     use super::*;
     use axum::{
         body::Body,
-        http::{header, Request, StatusCode},
+        http::{Request, StatusCode, header},
     };
     use http_body_util::BodyExt;
-    use sonic_rs::{json, JsonValueTrait, Value};
+    use sonic_rs::{JsonValueTrait, Value, json};
     use tower::ServiceExt;
 
     async fn json_body(response: axum::response::Response) -> Value {

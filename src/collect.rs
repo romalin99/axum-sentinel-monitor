@@ -6,8 +6,11 @@ use sysinfo::{
     CpuRefreshKind, Disks, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, System,
 };
 
+use crate::histogram::{WINDOW_SECS, window_rates};
 use crate::snapshot::{
-    CollectionStats, HttpStats, HttpStatusStats, ProcessStats, RuntimeStats, Snapshot, SystemStats,
+    CollectionStats, HttpEndpointStats, HttpRateStats, HttpSecondSample, HttpStats,
+    HttpStatusStats, HttpWindowStats, HttpWindows, LatencyStats, ProcessStats, RuntimeStats,
+    Snapshot, SystemStats,
 };
 use crate::stats::HttpMetrics;
 
@@ -23,12 +26,6 @@ pub(crate) struct Collector {
     network_received: u64,
     network_sent: u64,
     network_at: Instant,
-    http_seen: bool,
-    http_at: Instant,
-    last_requests: u64,
-    last_completed: u64,
-    last_status_4xx: u64,
-    last_status_5xx: u64,
 }
 
 impl Collector {
@@ -49,12 +46,6 @@ impl Collector {
             network_received: 0,
             network_sent: 0,
             network_at: now,
-            http_seen: false,
-            http_at: now,
-            last_requests: 0,
-            last_completed: 0,
-            last_status_4xx: 0,
-            last_status_5xx: 0,
         }
     }
 
@@ -72,7 +63,7 @@ impl Collector {
             process,
             runtime: collect_runtime(),
             system,
-            http: self.collect_http(http, now),
+            http: self.collect_http(http),
         }
     }
 
@@ -197,7 +188,7 @@ impl Collector {
         stats
     }
 
-    fn collect_http(&mut self, http: &HttpMetrics, now: Instant) -> HttpStats {
+    fn collect_http(&self, http: &HttpMetrics) -> HttpStats {
         let status = HttpStatusStats {
             status_1xx: http.status1(),
             status_2xx: http.status2(),
@@ -205,47 +196,80 @@ impl Collector {
             status_4xx: http.status4(),
             status_5xx: http.status5(),
         };
-        let completed = status.completed();
-        let requests = http.requests();
-        let window = http.latency().snapshot_and_reset();
-
-        let mut stats = HttpStats {
-            requests,
+        let traffic = http.latency().snapshot();
+        let window_30 = to_window_stats(&traffic.window_30);
+        let window_60 = to_window_stats(&traffic.window_60);
+        HttpStats {
+            requests: http.requests(),
             in_flight: http.in_flight(),
+            rps: Some(window_60.rps),
             status,
-            ..HttpStats::default()
-        };
-
-        if self.http_seen {
-            let elapsed = now.saturating_duration_since(self.http_at);
-            if !elapsed.is_zero() {
-                stats.rps = Some(
-                    counter_delta(requests, self.last_requests) as f64 / elapsed.as_secs_f64(),
-                );
-            }
-            let completed_delta = counter_delta(completed, self.last_completed);
-            if completed_delta > 0 {
-                stats.rates.status_4xx = Some(
-                    counter_delta(stats.status.status_4xx, self.last_status_4xx) as f64
-                        / completed_delta as f64,
-                );
-                stats.rates.status_5xx = Some(
-                    counter_delta(stats.status.status_5xx, self.last_status_5xx) as f64
-                        / completed_delta as f64,
-                );
-            }
-            stats.latency.p50_ns = window.percentile(50);
-            stats.latency.p95_ns = window.percentile(95);
-            stats.latency.p99_ns = window.percentile(99);
+            rates: window_60.rates.clone(),
+            latency: window_60.latency.clone(),
+            window_seconds: WINDOW_SECS as u32,
+            windows: HttpWindows {
+                secs_30: window_30,
+                secs_60: window_60,
+            },
+            series: traffic
+                .series
+                .into_iter()
+                .map(|sample| HttpSecondSample {
+                    t: sample.unix_secs,
+                    requests: sample.requests,
+                    status: status_from_counts(sample.status),
+                    p50_ns: sample.p50_ns,
+                    p95_ns: sample.p95_ns,
+                    p99_ns: sample.p99_ns,
+                    p999_ns: sample.p999_ns,
+                })
+                .collect(),
+            endpoints: http
+                .endpoints()
+                .snapshot()
+                .into_iter()
+                .map(|endpoint| HttpEndpointStats {
+                    method: endpoint.method,
+                    path: endpoint.path,
+                    in_flight: endpoint.in_flight,
+                    windows: HttpWindows {
+                        secs_30: to_window_stats(&endpoint.window_30),
+                        secs_60: to_window_stats(&endpoint.window_60),
+                    },
+                })
+                .collect(),
         }
+    }
+}
 
-        self.http_seen = true;
-        self.http_at = now;
-        self.last_requests = requests;
-        self.last_completed = completed;
-        self.last_status_4xx = stats.status.status_4xx;
-        self.last_status_5xx = stats.status.status_5xx;
-        stats
+fn to_window_stats(agg: &crate::histogram::WindowAgg) -> HttpWindowStats {
+    let (rate_4xx, rate_5xx) = window_rates(&agg.status, agg.requests);
+    HttpWindowStats {
+        seconds: agg.seconds,
+        covered_seconds: agg.covered_seconds,
+        requests: agg.requests,
+        rps: agg.rps,
+        status: status_from_counts(agg.status),
+        rates: HttpRateStats {
+            status_4xx: rate_4xx,
+            status_5xx: rate_5xx,
+        },
+        latency: LatencyStats {
+            p50_ns: agg.p50_ns,
+            p95_ns: agg.p95_ns,
+            p99_ns: agg.p99_ns,
+            p999_ns: agg.p999_ns,
+        },
+    }
+}
+
+fn status_from_counts(counts: [u64; 5]) -> HttpStatusStats {
+    HttpStatusStats {
+        status_1xx: counts[0],
+        status_2xx: counts[1],
+        status_3xx: counts[2],
+        status_4xx: counts[3],
+        status_5xx: counts[4],
     }
 }
 
@@ -419,11 +443,7 @@ fn open_descriptors() -> Option<i32> {
     }
     let mut count = 0u32;
     let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
-    if ok != 0 {
-        Some(count as i32)
-    } else {
-        None
-    }
+    if ok != 0 { Some(count as i32) } else { None }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -452,10 +472,6 @@ fn network_rates(
         Some((current_received - previous_received) as f64 / seconds),
         Some((current_sent - previous_sent) as f64 / seconds),
     )
-}
-
-fn counter_delta(current: u64, previous: u64) -> u64 {
-    current.saturating_sub(previous)
 }
 
 fn clamp_percent(value: f64) -> f64 {

@@ -10,7 +10,7 @@ keywords = ["axum", "monitoring", "dashboard", "metrics"]
 categories = ["web-programming", "development-tools::profiling"]
 
 [dependencies]
-axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "query", "tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 num_threads = "0.1"
 serde = { version = "1", features = ["derive"] }

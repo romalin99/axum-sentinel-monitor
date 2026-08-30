@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use axum::http::StatusCode;
 
 use crate::collect::Collector;
-use crate::endpoints::EndpointSet;
+use crate::endpoints::{EndpointSet, RouteHandle};
 use crate::histogram::SlidingWindow;
 use crate::snapshot::Snapshot;
 
@@ -58,10 +58,10 @@ impl SharedStats {
             .collect
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = &state.cache {
-            if entry.cached_at.elapsed() < self.refresh {
-                return entry.snapshot.clone();
-            }
+        if let Some(entry) = &state.cache
+            && entry.cached_at.elapsed() < self.refresh
+        {
+            return entry.snapshot.clone();
         }
         let snapshot = state.collector.collect(&self.http);
         state.cache = Some(CacheEntry {
@@ -89,26 +89,18 @@ impl HttpMetrics {
         }
     }
 
-    pub(crate) fn begin_request(&self, method: &str, path: &str) -> u64 {
-        let sequence = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+    pub(crate) fn begin_request(&self, method: &str, path: &str) -> RouteHandle {
+        self.requests.fetch_add(1, Ordering::Relaxed);
         self.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.endpoints.begin(method, path);
-        sequence
+        self.endpoints.begin(method, path)
     }
 
-    pub(crate) fn finish(
-        &self,
-        _sequence: u64,
-        elapsed: Duration,
-        status: StatusCode,
-        method: &str,
-        path: &str,
-    ) {
+    pub(crate) fn finish(&self, route: &RouteHandle, elapsed: Duration, status: StatusCode) {
         self.record_status(status);
         let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let class = (status.as_u16() / 100) as u8;
         self.latency.observe(ns, class);
-        self.endpoints.observe(method, path, ns, class);
+        self.endpoints.observe(route, ns, class);
     }
 
     fn record_status(&self, status: StatusCode) {
@@ -158,20 +150,19 @@ impl HttpMetrics {
         &self.endpoints
     }
 
-    pub(crate) fn end_in_flight(&self, method: &str, path: &str) {
+    pub(crate) fn end_in_flight(&self, route: &RouteHandle) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
-        self.endpoints.end(method, path);
+        route.end();
     }
 }
 
 pub(crate) struct InFlightGuard {
     pub(crate) stats: Arc<SharedStats>,
-    pub(crate) method: String,
-    pub(crate) path: String,
+    pub(crate) route: RouteHandle,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.stats.http.end_in_flight(&self.method, &self.path);
+        self.stats.http.end_in_flight(&self.route);
     }
 }

@@ -73,7 +73,7 @@ impl Monitor {
             &route,
             any(move |method: Method, headers: HeaderMap| {
                 let monitor = monitor.clone();
-                std::future::ready(monitor.respond(method, headers))
+                async move { monitor.respond(method, headers).await }
             }),
         )
     }
@@ -102,7 +102,20 @@ impl Monitor {
         &self.config
     }
 
-    fn respond(&self, method: Method, headers: HeaderMap) -> Response {
+    /// Collecting a snapshot makes blocking syscalls (process, network and disk
+    /// probes), so it runs on the blocking pool instead of stalling the worker
+    /// serving this request.
+    async fn collect_snapshot(&self) -> Snapshot {
+        let stats = Arc::clone(&self.stats);
+        match tokio::task::spawn_blocking(move || stats.snapshot()).await {
+            Ok(snapshot) => snapshot,
+            // The blocking pool is gone (runtime shutting down); collect inline
+            // rather than failing the request.
+            Err(_) => self.stats.snapshot(),
+        }
+    }
+
+    async fn respond(&self, method: Method, headers: HeaderMap) -> Response {
         if method != Method::GET {
             return (
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -114,7 +127,7 @@ impl Monitor {
         let wants_json = self.config.api_only || prefers_json(&headers);
 
         let mut response = if wants_json {
-            SonicJson(self.stats()).into_response()
+            SonicJson(self.collect_snapshot().await).into_response()
         } else {
             Html(dashboard::render(&self.config)).into_response()
         };

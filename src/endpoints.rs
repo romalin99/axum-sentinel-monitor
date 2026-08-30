@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::histogram::{SlidingWindow, WindowAgg};
+use crate::histogram::{SlidingWindow, WINDOW_SECS, WindowAgg};
 
 /// Upper bound on tracked routes. When the table is full a row is evicted in
 /// this order of preference: rows with no requests in the trailing 60s window
@@ -23,12 +23,34 @@ struct RouteMetrics {
     window: SlidingWindow,
     in_flight: AtomicU64,
     last_used: AtomicU64,
+    /// Tick of the most recent request, biased by one so `0` means "never". Lets
+    /// eviction test the 60s window with a single load instead of walking all
+    /// [`WINDOW_SECS`] slots of the route's histogram.
+    last_observe: AtomicU64,
 }
 
 impl RouteMetrics {
     fn touch(&self, clock: &AtomicU64) {
         let tick = clock.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         self.last_used.store(tick, Ordering::Relaxed);
+    }
+
+    fn is_cold(&self, tick: u64) -> bool {
+        match self.last_observe.load(Ordering::Relaxed) {
+            0 => true,
+            stamp => tick.saturating_sub(stamp - 1) >= WINDOW_SECS,
+        }
+    }
+}
+
+/// Resolved route slot handed to the caller for the lifetime of one request, so
+/// the method and path are normalized and looked up once instead of once per
+/// begin/observe/end step.
+pub(crate) struct RouteHandle(Arc<RouteMetrics>);
+
+impl RouteHandle {
+    pub(crate) fn end(&self) {
+        saturating_dec(&self.0.in_flight);
     }
 }
 
@@ -58,36 +80,28 @@ impl EndpointSet {
         }
     }
 
-    pub(crate) fn begin(&self, method: &str, path: &str) {
-        self.route_metrics(method, path)
-            .in_flight
-            .fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn begin(&self, method: &str, path: &str) -> RouteHandle {
+        let metrics = self.route_metrics(method, path);
+        metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+        RouteHandle(metrics)
     }
 
-    pub(crate) fn end(&self, method: &str, path: &str) {
-        let key = RouteKey {
-            method: normalize_method(method),
-            path: normalize_path(path),
-        };
-        let overflow = RouteKey {
-            method: "*".into(),
-            path: "/...".into(),
-        };
-        let routes = self
-            .routes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let metrics = routes.get(&key).or_else(|| routes.get(&overflow)).cloned();
-        drop(routes);
-        if let Some(metrics) = metrics {
-            saturating_dec(&metrics.in_flight);
-        }
+    pub(crate) fn observe(&self, route: &RouteHandle, ns: u64, status_class: u8) {
+        route
+            .0
+            .last_observe
+            .store(self.tick().saturating_add(1), Ordering::Relaxed);
+        route.0.window.observe(ns, status_class);
     }
 
-    pub(crate) fn observe(&self, method: &str, path: &str, ns: u64, status_class: u8) {
-        self.route_metrics(method, path)
-            .window
-            .observe(ns, status_class);
+    #[cfg(test)]
+    fn observe_path(&self, method: &str, path: &str, ns: u64, status_class: u8) {
+        let route = RouteHandle(self.route_metrics(method, path));
+        self.observe(&route, ns, status_class);
+    }
+
+    fn tick(&self) -> u64 {
+        self.origin.elapsed().as_secs() + self.extra_secs.load(Ordering::Relaxed)
     }
 
     pub(crate) fn snapshot(&self) -> Vec<EndpointTraffic> {
@@ -132,7 +146,7 @@ impl EndpointSet {
             existing.touch(&self.clock);
             return Arc::clone(existing);
         }
-        if routes.len() >= MAX_ENDPOINTS && !evict_one(&mut routes) {
+        if routes.len() >= MAX_ENDPOINTS && !evict_one(&mut routes, self.tick()) {
             let overflow = RouteKey {
                 method: "*".into(),
                 path: "/...".into(),
@@ -155,6 +169,7 @@ impl EndpointSet {
             window: SlidingWindow::with_clock(self.origin, Arc::clone(&self.extra_secs)),
             in_flight: AtomicU64::new(0),
             last_used: AtomicU64::new(0),
+            last_observe: AtomicU64::new(0),
         })
     }
 }
@@ -163,7 +178,7 @@ impl EndpointSet {
 /// 60s window and breaking ties by least recently used. Returns `false` when
 /// every row is in flight — the caller then falls back to the shared overflow
 /// row so the table stays bounded either way.
-fn evict_one(routes: &mut HashMap<RouteKey, Arc<RouteMetrics>>) -> bool {
+fn evict_one(routes: &mut HashMap<RouteKey, Arc<RouteMetrics>>, tick: u64) -> bool {
     let mut cold: Option<(RouteKey, u64)> = None;
     let mut warm: Option<(RouteKey, u64)> = None;
     for (key, metrics) in routes.iter() {
@@ -171,7 +186,7 @@ fn evict_one(routes: &mut HashMap<RouteKey, Arc<RouteMetrics>>) -> bool {
             continue;
         }
         let last_used = metrics.last_used.load(Ordering::Relaxed);
-        let group = if metrics.window.recent_requests() == 0 {
+        let group = if metrics.is_cold(tick) {
             &mut cold
         } else {
             &mut warm
@@ -209,6 +224,10 @@ pub(crate) fn normalize_method(method: &str) -> String {
     let method = method.trim();
     if method.is_empty() {
         return "GET".into();
+    }
+    // Nearly every request already carries a canonical upper-case method.
+    if method.len() <= 16 && method.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        return method.to_owned();
     }
     method
         .chars()
@@ -291,11 +310,11 @@ mod tests {
     #[test]
     fn sorts_busiest_endpoint_first() {
         let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
-        set.observe("GET", "/work", 1_000_000, 2);
-        set.observe("GET", "/work", 1_000_000, 2);
-        set.observe("GET", "/slow", 8_000_000, 2);
-        set.observe("POST", "/user", 2_000_000, 2);
-        set.observe("GET", "/fail", 3_000_000, 5);
+        set.observe_path("GET", "/work", 1_000_000, 2);
+        set.observe_path("GET", "/work", 1_000_000, 2);
+        set.observe_path("GET", "/slow", 8_000_000, 2);
+        set.observe_path("POST", "/user", 2_000_000, 2);
+        set.observe_path("GET", "/fail", 3_000_000, 5);
         let rows = set.snapshot();
         assert_eq!(rows[0].method, "GET");
         assert_eq!(rows[0].path, "/work");
@@ -311,19 +330,19 @@ mod tests {
     #[test]
     fn tracks_in_flight_ahead_of_completed_traffic() {
         let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
-        set.observe("GET", "/work", 1_000_000, 2);
-        set.observe("GET", "/work", 1_000_000, 2);
-        set.begin("GET", "/hold");
-        set.begin("GET", "/hold");
+        set.observe_path("GET", "/work", 1_000_000, 2);
+        set.observe_path("GET", "/work", 1_000_000, 2);
+        let first = set.begin("GET", "/hold");
+        let second = set.begin("GET", "/hold");
         let rows = set.snapshot();
         assert_eq!(rows[0].path, "/hold");
         assert_eq!(rows[0].in_flight, 2);
         assert_eq!(rows[0].window_60.requests, 0);
         assert_eq!(rows[1].path, "/work");
         assert_eq!(rows[1].window_60.requests, 2);
-        set.end("GET", "/hold");
+        first.end();
         assert_eq!(set.snapshot()[0].in_flight, 1);
-        set.end("GET", "/hold");
+        second.end();
         let idle = set.snapshot();
         assert_eq!(
             idle.iter()
@@ -339,7 +358,7 @@ mod tests {
     fn expired_window_drops_endpoint_counts() {
         let extra = Arc::new(AtomicU64::new(0));
         let set = EndpointSet::with_clock(Instant::now(), Arc::clone(&extra));
-        set.observe(
+        set.observe_path(
             "GET",
             "/work",
             Duration::from_millis(4).as_nanos() as u64,
@@ -357,13 +376,13 @@ mod tests {
     fn evicts_least_recently_used_when_full() {
         let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
         for index in 0..MAX_ENDPOINTS {
-            set.observe("GET", &format!("/route-{index}"), 1_000_000, 2);
+            set.observe_path("GET", &format!("/route-{index}"), 1_000_000, 2);
         }
         assert_eq!(set.snapshot().len(), MAX_ENDPOINTS);
 
         // `/route-0` was the oldest; touching it hands the LRU slot to `/route-1`.
-        set.observe("GET", "/route-0", 1_000_000, 2);
-        set.observe("GET", "/fresh", 1_000_000, 2);
+        set.observe_path("GET", "/route-0", 1_000_000, 2);
+        set.observe_path("GET", "/fresh", 1_000_000, 2);
 
         let paths: Vec<String> = set.snapshot().into_iter().map(|row| row.path).collect();
         assert_eq!(paths.len(), MAX_ENDPOINTS);
@@ -376,20 +395,20 @@ mod tests {
     #[test]
     fn never_evicts_rows_with_in_flight_requests() {
         let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
-        set.begin("GET", "/hold");
+        let hold = set.begin("GET", "/hold");
         for index in 0..(MAX_ENDPOINTS * 2) {
-            set.observe("GET", &format!("/route-{index}"), 1_000_000, 2);
+            set.observe_path("GET", &format!("/route-{index}"), 1_000_000, 2);
         }
 
         let rows = set.snapshot();
         assert_eq!(rows.len(), MAX_ENDPOINTS);
-        let hold = rows
+        let row = rows
             .iter()
             .find(|row| row.path == "/hold")
             .expect("in-flight row survives eviction");
-        assert_eq!(hold.in_flight, 1);
+        assert_eq!(row.in_flight, 1);
 
-        set.end("GET", "/hold");
+        hold.end();
         let idle = set.snapshot();
         assert_eq!(
             idle.iter().find(|row| row.path == "/hold").unwrap().in_flight,
@@ -401,9 +420,9 @@ mod tests {
     fn falls_back_to_overflow_when_every_row_is_in_flight() {
         let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
         for index in 0..MAX_ENDPOINTS {
-            set.begin("GET", &format!("/hold-{index}"));
+            let _held = set.begin("GET", &format!("/hold-{index}"));
         }
-        set.begin("GET", "/extra");
+        let extra = set.begin("GET", "/extra");
 
         let rows = set.snapshot();
         let overflow = rows
@@ -412,7 +431,7 @@ mod tests {
             .expect("overflow row when nothing is evictable");
         assert_eq!(overflow.in_flight, 1);
 
-        set.end("GET", "/extra");
+        extra.end();
         let drained = set.snapshot();
         assert_eq!(
             drained.iter().find(|row| row.path == "/...").unwrap().in_flight,
@@ -424,18 +443,17 @@ mod tests {
     fn evicts_rows_without_recent_traffic_before_the_lru_row() {
         let extra = Arc::new(AtomicU64::new(0));
         let set = EndpointSet::with_clock(Instant::now(), Arc::clone(&extra));
-        set.observe("GET", "/stale", 1_000_000, 2);
+        set.observe_path("GET", "/stale", 1_000_000, 2);
         extra.fetch_add(61, Ordering::Relaxed);
         for index in 0..(MAX_ENDPOINTS - 1) {
-            set.observe("GET", &format!("/route-{index}"), 1_000_000, 2);
+            set.observe_path("GET", &format!("/route-{index}"), 1_000_000, 2);
         }
         assert_eq!(set.snapshot().len(), MAX_ENDPOINTS);
 
         // `begin`/`end` refresh the LRU position without recording a request, so
         // `/stale` is now the most recently used row yet still has an empty window.
-        set.begin("GET", "/stale");
-        set.end("GET", "/stale");
-        set.observe("GET", "/fresh", 1_000_000, 2);
+        set.begin("GET", "/stale").end();
+        set.observe_path("GET", "/fresh", 1_000_000, 2);
 
         let paths: Vec<String> = set.snapshot().into_iter().map(|row| row.path).collect();
         assert_eq!(paths.len(), MAX_ENDPOINTS);

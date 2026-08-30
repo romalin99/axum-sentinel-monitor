@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use sysinfo::{
-    CpuRefreshKind, Disks, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, System,
+    CpuRefreshKind, DiskRefreshKind, Disks, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate,
+    System,
 };
 
 use crate::histogram::{WINDOW_SECS, window_rates};
@@ -14,9 +15,19 @@ use crate::snapshot::{
 };
 use crate::stats::HttpMetrics;
 
+/// Disk usage is sampled at most this often. Reading it costs ~20ms per call
+/// (the per-mount `statfs` dominates, not the enumeration — refreshing a
+/// resident `Disks` is no cheaper than rebuilding it), and the figure moves far
+/// too slowly to be worth that on every dashboard poll.
+const DISK_TTL: Duration = Duration::from_secs(30);
+
 pub(crate) struct Collector {
     system: System,
     networks: Networks,
+    disks: Disks,
+    disk_root: Option<PathBuf>,
+    disk_cache: Option<DiskUsage>,
+    disk_at: Option<Instant>,
     pid: Pid,
     num_cpu: usize,
     started: Instant,
@@ -33,10 +44,22 @@ impl Collector {
         let mut system = System::new();
         system.refresh_cpu_list(CpuRefreshKind::nothing().with_cpu_usage());
         let networks = Networks::new_with_refreshed_list();
+        // Mount points and file-system names are enumerated once: re-listing disks
+        // costs tens of milliseconds and would run on the caller's thread.
+        let disks = Disks::new_with_refreshed_list_specifics(
+            DiskRefreshKind::nothing().with_kind().with_storage(),
+        );
+        let disk_root = std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.canonicalize().unwrap_or(cwd));
         let now = Instant::now();
         Self {
             system,
             networks,
+            disks,
+            disk_root,
+            disk_cache: None,
+            disk_at: None,
             pid: Pid::from_u32(std::process::id()),
             num_cpu: 1,
             started: now,
@@ -135,7 +158,7 @@ impl Collector {
             errors.push("system.memory".into());
         }
 
-        match application_disk() {
+        match self.application_disk() {
             Some(disk) => {
                 stats.disk_used_percent = Some(disk.used_percent);
                 stats.disk_used_bytes = Some(disk.used);
@@ -273,6 +296,7 @@ fn status_from_counts(counts: [u64; 5]) -> HttpStatusStats {
     }
 }
 
+#[derive(Clone)]
 struct DiskUsage {
     used_percent: f64,
     used: u64,
@@ -281,28 +305,48 @@ struct DiskUsage {
     fs_type: String,
 }
 
-fn application_disk() -> Option<DiskUsage> {
-    let cwd = std::env::current_dir().ok()?;
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    let disks = Disks::new_with_refreshed_list();
-    let disk = disks
-        .list()
-        .iter()
-        .filter(|disk| path_on_mount(&cwd, disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().as_os_str().len())?;
-    let total = disk.total_space();
-    if total == 0 {
-        return None;
+impl Collector {
+    /// Returns the cached disk usage, refreshing it at most once per
+    /// [`DISK_TTL`]. Mount points and file-system names are those captured at
+    /// startup; only storage figures are re-read.
+    fn application_disk(&mut self) -> Option<DiskUsage> {
+        if let Some(at) = self.disk_at
+            && at.elapsed() < DISK_TTL
+        {
+            return self.disk_cache.clone();
+        }
+        self.disks
+            .refresh_specifics(false, DiskRefreshKind::nothing().with_storage());
+        let usage = self.read_disk();
+        // Stamped even when the lookup fails, so a missing mount does not turn
+        // into a ~20ms probe on every collect.
+        self.disk_at = Some(Instant::now());
+        self.disk_cache = usage.clone();
+        usage
     }
-    let free = disk.available_space();
-    let used = total.saturating_sub(free);
-    Some(DiskUsage {
-        used_percent: used as f64 / total as f64 * 100.0,
-        used,
-        total,
-        free,
-        fs_type: disk.file_system().to_string_lossy().into_owned(),
-    })
+
+    fn read_disk(&self) -> Option<DiskUsage> {
+        let root = self.disk_root.as_deref()?;
+        let disk = self
+            .disks
+            .list()
+            .iter()
+            .filter(|disk| path_on_mount(root, disk.mount_point()))
+            .max_by_key(|disk| disk.mount_point().as_os_str().len())?;
+        let total = disk.total_space();
+        if total == 0 {
+            return None;
+        }
+        let free = disk.available_space();
+        let used = total.saturating_sub(free);
+        Some(DiskUsage {
+            used_percent: used as f64 / total as f64 * 100.0,
+            used,
+            total,
+            free,
+            fs_type: disk.file_system().to_string_lossy().into_owned(),
+        })
+    }
 }
 
 fn path_on_mount(path: &Path, mount: &Path) -> bool {

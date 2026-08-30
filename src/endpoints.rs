@@ -5,6 +5,11 @@ use std::time::Instant;
 
 use crate::histogram::{SlidingWindow, WindowAgg};
 
+/// Upper bound on tracked routes. When the table is full a row is evicted in
+/// this order of preference: rows with no requests in the trailing 60s window
+/// first, then the rest, least recently used first within each group. Rows with
+/// in-flight requests are never evicted, so a long-running request keeps its row
+/// until it completes.
 const MAX_ENDPOINTS: usize = 64;
 const MAX_PATH_CHARS: usize = 128;
 
@@ -17,11 +22,20 @@ struct RouteKey {
 struct RouteMetrics {
     window: SlidingWindow,
     in_flight: AtomicU64,
+    last_used: AtomicU64,
+}
+
+impl RouteMetrics {
+    fn touch(&self, clock: &AtomicU64) {
+        let tick = clock.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        self.last_used.store(tick, Ordering::Relaxed);
+    }
 }
 
 pub(crate) struct EndpointSet {
     origin: Instant,
     extra_secs: Arc<AtomicU64>,
+    clock: AtomicU64,
     routes: Mutex<HashMap<RouteKey, Arc<RouteMetrics>>>,
 }
 
@@ -39,6 +53,7 @@ impl EndpointSet {
         Self {
             origin,
             extra_secs,
+            clock: AtomicU64::new(0),
             routes: Mutex::new(HashMap::new()),
         }
     }
@@ -114,19 +129,23 @@ impl EndpointSet {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = routes.get(&key) {
+            existing.touch(&self.clock);
             return Arc::clone(existing);
         }
-        if routes.len() >= MAX_ENDPOINTS {
+        if routes.len() >= MAX_ENDPOINTS && !evict_one(&mut routes) {
             let overflow = RouteKey {
                 method: "*".into(),
                 path: "/...".into(),
             };
-            return routes
+            let metrics = routes
                 .entry(overflow)
                 .or_insert_with(|| self.new_metrics())
                 .clone();
+            metrics.touch(&self.clock);
+            return metrics;
         }
         let created = self.new_metrics();
+        created.touch(&self.clock);
         routes.insert(key, Arc::clone(&created));
         created
     }
@@ -135,8 +154,40 @@ impl EndpointSet {
         Arc::new(RouteMetrics {
             window: SlidingWindow::with_clock(self.origin, Arc::clone(&self.extra_secs)),
             in_flight: AtomicU64::new(0),
+            last_used: AtomicU64::new(0),
         })
     }
+}
+
+/// Drops one idle row, preferring routes that saw no request in the trailing
+/// 60s window and breaking ties by least recently used. Returns `false` when
+/// every row is in flight — the caller then falls back to the shared overflow
+/// row so the table stays bounded either way.
+fn evict_one(routes: &mut HashMap<RouteKey, Arc<RouteMetrics>>) -> bool {
+    let mut cold: Option<(RouteKey, u64)> = None;
+    let mut warm: Option<(RouteKey, u64)> = None;
+    for (key, metrics) in routes.iter() {
+        if metrics.in_flight.load(Ordering::Relaxed) != 0 {
+            continue;
+        }
+        let last_used = metrics.last_used.load(Ordering::Relaxed);
+        let group = if metrics.window.recent_requests() == 0 {
+            &mut cold
+        } else {
+            &mut warm
+        };
+        if group
+            .as_ref()
+            .is_none_or(|(_, oldest)| last_used < *oldest)
+        {
+            *group = Some((key.clone(), last_used));
+        }
+    }
+    let Some((victim, _)) = cold.or(warm) else {
+        return false;
+    };
+    routes.remove(&victim);
+    true
 }
 
 fn saturating_dec(value: &AtomicU64) {
@@ -300,5 +351,97 @@ mod tests {
         assert!(expired[0].window_60.p50_ns.is_none());
         assert_eq!(expired[0].window_30.requests, 0);
         assert_eq!(expired[0].in_flight, 0);
+    }
+
+    #[test]
+    fn evicts_least_recently_used_when_full() {
+        let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
+        for index in 0..MAX_ENDPOINTS {
+            set.observe("GET", &format!("/route-{index}"), 1_000_000, 2);
+        }
+        assert_eq!(set.snapshot().len(), MAX_ENDPOINTS);
+
+        // `/route-0` was the oldest; touching it hands the LRU slot to `/route-1`.
+        set.observe("GET", "/route-0", 1_000_000, 2);
+        set.observe("GET", "/fresh", 1_000_000, 2);
+
+        let paths: Vec<String> = set.snapshot().into_iter().map(|row| row.path).collect();
+        assert_eq!(paths.len(), MAX_ENDPOINTS);
+        assert!(paths.iter().any(|path| path == "/fresh"));
+        assert!(paths.iter().any(|path| path == "/route-0"));
+        assert!(!paths.iter().any(|path| path == "/route-1"));
+        assert!(!paths.iter().any(|path| path == "/..."));
+    }
+
+    #[test]
+    fn never_evicts_rows_with_in_flight_requests() {
+        let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
+        set.begin("GET", "/hold");
+        for index in 0..(MAX_ENDPOINTS * 2) {
+            set.observe("GET", &format!("/route-{index}"), 1_000_000, 2);
+        }
+
+        let rows = set.snapshot();
+        assert_eq!(rows.len(), MAX_ENDPOINTS);
+        let hold = rows
+            .iter()
+            .find(|row| row.path == "/hold")
+            .expect("in-flight row survives eviction");
+        assert_eq!(hold.in_flight, 1);
+
+        set.end("GET", "/hold");
+        let idle = set.snapshot();
+        assert_eq!(
+            idle.iter().find(|row| row.path == "/hold").unwrap().in_flight,
+            0
+        );
+    }
+
+    #[test]
+    fn falls_back_to_overflow_when_every_row_is_in_flight() {
+        let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
+        for index in 0..MAX_ENDPOINTS {
+            set.begin("GET", &format!("/hold-{index}"));
+        }
+        set.begin("GET", "/extra");
+
+        let rows = set.snapshot();
+        let overflow = rows
+            .iter()
+            .find(|row| row.path == "/...")
+            .expect("overflow row when nothing is evictable");
+        assert_eq!(overflow.in_flight, 1);
+
+        set.end("GET", "/extra");
+        let drained = set.snapshot();
+        assert_eq!(
+            drained.iter().find(|row| row.path == "/...").unwrap().in_flight,
+            0
+        );
+    }
+
+    #[test]
+    fn evicts_rows_without_recent_traffic_before_the_lru_row() {
+        let extra = Arc::new(AtomicU64::new(0));
+        let set = EndpointSet::with_clock(Instant::now(), Arc::clone(&extra));
+        set.observe("GET", "/stale", 1_000_000, 2);
+        extra.fetch_add(61, Ordering::Relaxed);
+        for index in 0..(MAX_ENDPOINTS - 1) {
+            set.observe("GET", &format!("/route-{index}"), 1_000_000, 2);
+        }
+        assert_eq!(set.snapshot().len(), MAX_ENDPOINTS);
+
+        // `begin`/`end` refresh the LRU position without recording a request, so
+        // `/stale` is now the most recently used row yet still has an empty window.
+        set.begin("GET", "/stale");
+        set.end("GET", "/stale");
+        set.observe("GET", "/fresh", 1_000_000, 2);
+
+        let paths: Vec<String> = set.snapshot().into_iter().map(|row| row.path).collect();
+        assert_eq!(paths.len(), MAX_ENDPOINTS);
+        assert!(paths.iter().any(|path| path == "/fresh"));
+        assert!(!paths.iter().any(|path| path == "/stale"));
+        // The true LRU row survives because a cold row outranks it for eviction.
+        assert!(paths.iter().any(|path| path == "/route-0"));
     }
 }

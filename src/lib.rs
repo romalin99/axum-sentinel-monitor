@@ -5,7 +5,10 @@
 //! the monitor endpoint itself are not counted. HTTP QPS and latency percentiles
 //! are computed in-process from a 60-second ring; samples older than
 //! [`HTTP_WINDOW`] are discarded. The dashboard API tab also lists per-route
-//! in-flight calls plus 30s/60s QPS and P50/P95/P99/P999.
+//! in-flight calls plus 30s/60s QPS and P50/P95/P99/P999. At most 64 routes are
+//! tracked: once the table is full, routes with no request in the trailing 60s
+//! window are evicted first and the least recently used row goes first within
+//! that group, while rows with in-flight requests are never evicted.
 
 mod collect;
 mod config;

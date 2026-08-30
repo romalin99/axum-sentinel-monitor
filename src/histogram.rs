@@ -196,6 +196,25 @@ impl SlidingWindow {
         }
     }
 
+    /// Requests recorded in the trailing [`WINDOW_SECS`] window. Reads only the
+    /// per-second counters — no latency histograms, no allocation — so eviction
+    /// scans can afford to call it once per tracked route.
+    pub(crate) fn recent_requests(&self) -> u64 {
+        let tick = self.tick();
+        (0..WINDOW_SECS)
+            .take_while(|age| tick >= *age)
+            .map(|age| {
+                let slot_tick = tick - age;
+                let slot = &self.slots[(slot_tick % WINDOW_SECS) as usize];
+                if slot.tick.load(Ordering::Acquire) == slot_tick {
+                    slot.requests.load(Ordering::Relaxed)
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
     fn slot_for(&self, tick: u64) -> &Slot {
         let slot = &self.slots[(tick % WINDOW_SECS) as usize];
         loop {

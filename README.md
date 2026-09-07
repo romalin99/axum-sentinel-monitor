@@ -128,6 +128,16 @@ the kernel no longer keeps resident. `heap_sys_bytes - heap_released_bytes`
 is a lower bound. On macOS the default zone statistics are used and
 `heap_released_bytes` is `0`; other targets report zeros.
 
+When the host binary uses `tikv-jemallocator` as its global allocator, enable the
+`jemalloc` feature: heap figures then come from jemalloc's own `stats.*`
+(`tikv-jemalloc-ctl`) — `heap_alloc_bytes` = allocated, `heap_inuse_bytes` =
+active, `heap_sys_bytes` = mapped + retained, `heap_released_bytes` = retained +
+(mapped − resident), `heap_idle_bytes` = sys − active — so **Heap Resident**
+equals jemalloc's `resident`. Without the feature, a jemalloc-backed process makes
+the glibc-based `heap_released_bytes` meaningless (jemalloc's anonymous pages swamp
+`RssAnon`). Under the feature the native-library (glibc) heap is no longer part of
+heap_*; `process.rss_bytes` still covers everything.
+
 ## Security
 
 Runtime metrics can reveal process and host information. Do not expose the

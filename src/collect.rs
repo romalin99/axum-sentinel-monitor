@@ -365,7 +365,7 @@ fn collect_runtime() -> RuntimeStats {
         goroutines: tasks,
         heap_alloc_bytes: heap.alloc_bytes,
         heap_sys_bytes: heap.sys_bytes,
-        heap_inuse_bytes: heap.alloc_bytes,
+        heap_inuse_bytes: heap.inuse_bytes,
         heap_idle_bytes: heap.idle_bytes,
         heap_released_bytes: heap.released_bytes,
         workers,
@@ -375,9 +375,45 @@ fn collect_runtime() -> RuntimeStats {
 #[derive(Default)]
 struct AllocatorStats {
     alloc_bytes: u64,
+    /// Page-granular in-use bytes (Go `HeapInuse`); equals `alloc_bytes` where the
+    /// allocator exposes no such figure.
+    inuse_bytes: u64,
     sys_bytes: u64,
     idle_bytes: u64,
     released_bytes: u64,
+}
+
+/// jemalloc (`tikv-jemalloc-ctl`, feature `jemalloc`): Go `MemStats` mapping over
+/// `stats.*` — `HeapAlloc` = allocated, `HeapInuse` = active, `HeapSys` = mapped + retained
+/// (address space obtained, including what was handed back), `HeapReleased` = retained +
+/// (mapped − resident) (pages the kernel no longer holds), `HeapIdle` = sys − active.
+/// `heap_sys − heap_released` therefore equals jemalloc's own `resident`. Statistics are
+/// cached by jemalloc and refreshed by advancing the epoch first. A failed mallctl read
+/// yields zeros (the allocator is not jemalloc, or stats were compiled out).
+#[cfg(feature = "jemalloc")]
+fn allocator_stats() -> AllocatorStats {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    let widen = |v: Result<usize, tikv_jemalloc_ctl::Error>| v.map(|n| n as u64);
+    if epoch::advance().is_err() {
+        return AllocatorStats::default();
+    }
+    let (Ok(allocated), Ok(active), Ok(resident), Ok(mapped), Ok(retained)) = (
+        widen(stats::allocated::read()),
+        widen(stats::active::read()),
+        widen(stats::resident::read()),
+        widen(stats::mapped::read()),
+        widen(stats::retained::read()),
+    ) else {
+        return AllocatorStats::default();
+    };
+    let sys_bytes = mapped.saturating_add(retained);
+    AllocatorStats {
+        alloc_bytes: allocated,
+        inuse_bytes: active,
+        sys_bytes,
+        idle_bytes: sys_bytes.saturating_sub(active),
+        released_bytes: retained.saturating_add(mapped.saturating_sub(resident)),
+    }
 }
 
 fn tokio_runtime_counts() -> (u64, i32) {
@@ -401,7 +437,7 @@ fn tokio_runtime_counts() -> (u64, i32) {
     }
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"))]
 fn allocator_stats() -> AllocatorStats {
     #[repr(C)]
     struct Mallinfo2 {
@@ -434,6 +470,7 @@ fn allocator_stats() -> AllocatorStats {
     };
     AllocatorStats {
         alloc_bytes: info.uordblks as u64,
+        inuse_bytes: info.uordblks as u64,
         sys_bytes,
         idle_bytes,
         released_bytes,
@@ -447,7 +484,7 @@ fn allocator_stats() -> AllocatorStats {
 /// `resident` is RssAnon, which also counts thread stacks and non-malloc anonymous
 /// mappings, so the result is a lower bound: a few MB of stacks read as "still
 /// resident heap". On a trimmed process the error is small next to the pages returned.
-#[cfg(any(all(target_os = "linux", target_env = "gnu"), test))]
+#[cfg(any(all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"), test))]
 fn reconcile_released(sys_bytes: u64, idle_bytes: u64, resident_anonymous: u64) -> u64 {
     sys_bytes
         .saturating_sub(resident_anonymous)
@@ -456,14 +493,14 @@ fn reconcile_released(sys_bytes: u64, idle_bytes: u64, resident_anonymous: u64) 
 }
 
 /// `RssAnon` from `/proc/self/status`, in bytes.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"))]
 fn resident_anonymous_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     parse_rss_anon_kb(&status).map(|kb| kb.saturating_mul(1024))
 }
 
 /// Pull the `RssAnon:` value (kB) out of a `/proc/<pid>/status` body.
-#[cfg(any(all(target_os = "linux", target_env = "gnu"), test))]
+#[cfg(any(all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"), test))]
 fn parse_rss_anon_kb(status: &str) -> Option<u64> {
     status
         .lines()
@@ -472,7 +509,7 @@ fn parse_rss_anon_kb(status: &str) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(not(feature = "jemalloc"), target_os = "macos"))]
 fn allocator_stats() -> AllocatorStats {
     #[repr(C)]
     struct MallocStatistics {
@@ -500,6 +537,7 @@ fn allocator_stats() -> AllocatorStats {
         malloc_zone_statistics(zone, &mut stats);
         AllocatorStats {
             alloc_bytes: stats.size_in_use as u64,
+            inuse_bytes: stats.size_in_use as u64,
             sys_bytes: stats.size_allocated as u64,
             idle_bytes: stats.size_allocated.saturating_sub(stats.size_in_use) as u64,
             released_bytes: 0,
@@ -507,7 +545,11 @@ fn allocator_stats() -> AllocatorStats {
     }
 }
 
-#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
+#[cfg(not(any(
+    feature = "jemalloc",
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "macos"
+)))]
 fn allocator_stats() -> AllocatorStats {
     AllocatorStats::default()
 }

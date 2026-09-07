@@ -37,7 +37,8 @@ pub struct RuntimeStats {
     /// `mallinfo2().arena + hblkhd`, a high-water mark that `malloc_trim` does not
     /// shrink; `heap_sys_bytes - heap_released_bytes` is the resident heap.
     pub heap_sys_bytes: u64,
-    /// Same as `heap_alloc_bytes` (Rust has no span-level in-use accounting).
+    /// Page-granular in-use bytes: jemalloc `stats.active` under the `jemalloc` feature;
+    /// otherwise the same as `heap_alloc_bytes` (glibc/macOS expose no such figure).
     pub heap_inuse_bytes: u64,
     /// Free chunks inside the heap (includes pages already returned to the OS).
     pub heap_idle_bytes: u64,

@@ -1,6 +1,6 @@
 [package]
 name = "axum-sentinel-monitor"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.98.1"
 description = "A Fiber Monitor-style runtime dashboard for Axum"
@@ -18,6 +18,14 @@ sonic-rs = "0.5"
 sysinfo = "0.39"
 tokio = { version = "1", default-features = false, features = ["rt"] }
 tower = "0.5"
+tikv-jemalloc-ctl = { version = "0.7", optional = true, features = ["use_std", "stats"] }
+
+[features]
+default = []
+# Read the heap figures from jemalloc (`stats.*` via tikv-jemalloc-ctl) instead of glibc's
+# `mallinfo2`. Enable when the host binary uses `tikv-jemallocator` as its global allocator;
+# the C-side glibc heap (native libraries) is then no longer reflected in heap_*.
+jemalloc = ["dep:tikv-jemalloc-ctl"]
 
 [dev-dependencies]
 http-body-util = "0.1"

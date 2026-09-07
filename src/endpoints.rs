@@ -1,6 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::histogram::{SlidingWindow, WINDOW_SECS, WindowAgg};
@@ -13,10 +14,19 @@ use crate::histogram::{SlidingWindow, WINDOW_SECS, WindowAgg};
 const MAX_ENDPOINTS: usize = 64;
 const MAX_PATH_CHARS: usize = 128;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct RouteKey {
-    method: String,
-    path: String,
+/// Route table key: `"<METHOD> <normalized path>"` in one string, so a lookup can be
+/// done with a borrowed `&str` built in a reusable per-thread buffer — no allocation and
+/// no exclusive lock on the hot path. The two halves are split back out for snapshots.
+type RouteKey = String;
+
+const KEY_SEPARATOR: char = ' ';
+
+thread_local! {
+    static KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(MAX_PATH_CHARS + 24));
+}
+
+fn split_key(key: &str) -> (&str, &str) {
+    key.split_once(KEY_SEPARATOR).unwrap_or((key, "/"))
 }
 
 struct RouteMetrics {
@@ -58,7 +68,7 @@ pub(crate) struct EndpointSet {
     origin: Instant,
     extra_secs: Arc<AtomicU64>,
     clock: AtomicU64,
-    routes: Mutex<HashMap<RouteKey, Arc<RouteMetrics>>>,
+    routes: RwLock<HashMap<RouteKey, Arc<RouteMetrics>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,7 +86,7 @@ impl EndpointSet {
             origin,
             extra_secs,
             clock: AtomicU64::new(0),
-            routes: Mutex::new(HashMap::new()),
+            routes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -107,15 +117,16 @@ impl EndpointSet {
     pub(crate) fn snapshot(&self) -> Vec<EndpointTraffic> {
         let routes = self
             .routes
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut rows: Vec<EndpointTraffic> = routes
             .iter()
             .map(|(key, metrics)| {
                 let traffic = metrics.window.snapshot();
+                let (method, path) = split_key(key);
                 EndpointTraffic {
-                    method: key.method.clone(),
-                    path: key.path.clone(),
+                    method: method.to_owned(),
+                    path: path.to_owned(),
                     in_flight: metrics.in_flight.load(Ordering::Relaxed),
                     window_30: traffic.window_30,
                     window_60: traffic.window_60,
@@ -134,34 +145,45 @@ impl EndpointSet {
     }
 
     fn route_metrics(&self, method: &str, path: &str) -> Arc<RouteMetrics> {
-        let key = RouteKey {
-            method: normalize_method(method),
-            path: normalize_path(path),
-        };
-        let mut routes = self
-            .routes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(existing) = routes.get(&key) {
-            existing.touch(&self.clock);
-            return Arc::clone(existing);
-        }
-        if routes.len() >= MAX_ENDPOINTS && !evict_one(&mut routes, self.tick()) {
-            let overflow = RouteKey {
-                method: "*".into(),
-                path: "/...".into(),
-            };
-            let metrics = routes
-                .entry(overflow)
-                .or_insert_with(|| self.new_metrics())
-                .clone();
-            metrics.touch(&self.clock);
-            return metrics;
-        }
-        let created = self.new_metrics();
-        created.touch(&self.clock);
-        routes.insert(key, Arc::clone(&created));
-        created
+        KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            key.clear();
+            write_normalized_method(&mut key, method);
+            key.push(KEY_SEPARATOR);
+            write_normalized_path(&mut key, path);
+            // Hot path: a known route is a shared read lock + one hash lookup, zero allocation.
+            {
+                let routes = self
+                    .routes
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(existing) = routes.get(key.as_str()) {
+                    existing.touch(&self.clock);
+                    return Arc::clone(existing);
+                }
+            }
+            let mut routes = self
+                .routes
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Re-check: another thread may have inserted the row between the two locks.
+            if let Some(existing) = routes.get(key.as_str()) {
+                existing.touch(&self.clock);
+                return Arc::clone(existing);
+            }
+            if routes.len() >= MAX_ENDPOINTS && !evict_one(&mut routes, self.tick()) {
+                let metrics = routes
+                    .entry(format!("*{KEY_SEPARATOR}/..."))
+                    .or_insert_with(|| self.new_metrics())
+                    .clone();
+                metrics.touch(&self.clock);
+                return metrics;
+            }
+            let created = self.new_metrics();
+            created.touch(&self.clock);
+            routes.insert(key.clone(), Arc::clone(&created));
+            created
+        })
     }
 
     fn new_metrics(&self) -> Arc<RouteMetrics> {
@@ -220,25 +242,41 @@ fn saturating_dec(value: &AtomicU64) {
     }
 }
 
-pub(crate) fn normalize_method(method: &str) -> String {
+#[cfg(test)]
+fn normalize_method(method: &str) -> String {
+    let mut out = String::new();
+    write_normalized_method(&mut out, method);
+    out
+}
+
+/// Appends the canonical (trimmed, upper-case, ≤16 chars) method to `out`.
+fn write_normalized_method(out: &mut String, method: &str) {
     let method = method.trim();
     if method.is_empty() {
-        return "GET".into();
+        out.push_str("GET");
+        return;
     }
     // Nearly every request already carries a canonical upper-case method.
     if method.len() <= 16 && method.bytes().all(|byte| byte.is_ascii_uppercase()) {
-        return method.to_owned();
+        out.push_str(method);
+        return;
     }
-    method
-        .chars()
-        .take(16)
-        .map(|ch| ch.to_ascii_uppercase())
-        .collect()
+    out.extend(method.chars().take(16).map(|ch| ch.to_ascii_uppercase()));
 }
 
-pub(crate) fn normalize_path(path: &str) -> String {
+#[cfg(test)]
+fn normalize_path(path: &str) -> String {
+    let mut out = String::new();
+    write_normalized_path(&mut out, path);
+    out
+}
+
+/// Appends the normalized path (query stripped, id-like segments collapsed to `:id`,
+/// bounded to [`MAX_PATH_CHARS`]) to `out`.
+fn write_normalized_path(out: &mut String, path: &str) {
     let path = path.split(['?', '#']).next().unwrap_or("/");
-    let mut out = String::from("/");
+    let start = out.len();
+    out.push('/');
     let mut wrote = false;
     for segment in path.split('/') {
         if segment.is_empty() {
@@ -251,19 +289,17 @@ pub(crate) fn normalize_path(path: &str) -> String {
         if looks_like_id(segment) || is_route_param(segment) {
             out.push_str(":id");
         } else {
-            for ch in segment.chars().take(48) {
-                out.push(ch);
-            }
+            out.extend(segment.chars().take(48));
         }
-        if out.len() > MAX_PATH_CHARS {
-            out.truncate(MAX_PATH_CHARS);
+        if out.len() - start > MAX_PATH_CHARS {
+            let mut cut = start + MAX_PATH_CHARS;
+            while !out.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.truncate(cut);
             break;
         }
     }
-    if !wrote {
-        return "/".into();
-    }
-    out
 }
 
 fn is_route_param(segment: &str) -> bool {

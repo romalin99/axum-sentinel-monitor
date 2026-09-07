@@ -420,12 +420,56 @@ fn allocator_stats() -> AllocatorStats {
         fn mallinfo2() -> Mallinfo2;
     }
     let info = unsafe { mallinfo2() };
+    let sys_bytes = info.arena.saturating_add(info.hblkhd) as u64;
+    let idle_bytes = info.fordblks as u64;
+    // glibc keeps `arena` (system_mem) at its high-water mark: `malloc_trim` / `free`
+    // give pages back with MADV_DONTNEED but never shrink the bookkeeping, so
+    // `heap_sys` alone cannot be reconciled with RSS. The bytes actually handed back
+    // to the kernel are the part of the heap that is no longer resident, which the
+    // kernel does expose (RssAnon in /proc/self/status). `keepcost` is only the
+    // releasable top chunk of the main arena and is not that number.
+    let released_bytes = match resident_anonymous_bytes() {
+        Some(resident) => reconcile_released(sys_bytes, idle_bytes, resident),
+        None => 0,
+    };
     AllocatorStats {
         alloc_bytes: info.uordblks as u64,
-        sys_bytes: info.arena.saturating_add(info.hblkhd) as u64,
-        idle_bytes: info.fordblks as u64,
-        released_bytes: info.keepcost as u64,
+        sys_bytes,
+        idle_bytes,
+        released_bytes,
     }
+}
+
+/// Bytes of heap address space the kernel no longer keeps resident
+/// (Go's `HeapReleased`): `heap_sys - resident anonymous memory`, kept inside the
+/// `released <= idle <= sys` invariant so `sys - released` never exceeds RSS.
+///
+/// `resident` is RssAnon, which also counts thread stacks and non-malloc anonymous
+/// mappings, so the result is a lower bound: a few MB of stacks read as "still
+/// resident heap". On a trimmed process the error is small next to the pages returned.
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), test))]
+fn reconcile_released(sys_bytes: u64, idle_bytes: u64, resident_anonymous: u64) -> u64 {
+    sys_bytes
+        .saturating_sub(resident_anonymous)
+        .min(idle_bytes)
+        .min(sys_bytes)
+}
+
+/// `RssAnon` from `/proc/self/status`, in bytes.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn resident_anonymous_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_rss_anon_kb(&status).map(|kb| kb.saturating_mul(1024))
+}
+
+/// Pull the `RssAnon:` value (kB) out of a `/proc/<pid>/status` body.
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), test))]
+fn parse_rss_anon_kb(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("RssAnon:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
 }
 
 #[cfg(target_os = "macos")]
@@ -520,4 +564,28 @@ fn network_rates(
 
 fn clamp_percent(value: f64) -> f64 {
     value.clamp(0.0, 100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn released_is_sys_minus_resident_within_invariants() {
+        // 1,100 MB obtained, 800 MB free chunks, 400 MB still resident => 700 MB returned.
+        assert_eq!(reconcile_released(1100, 800, 400), 700);
+        // Nothing trimmed yet: resident covers the whole heap.
+        assert_eq!(reconcile_released(1100, 150, 1100), 0);
+        // RssAnon above heap_sys (large non-malloc mmaps): never negative.
+        assert_eq!(reconcile_released(500, 100, 900), 0);
+        // Released can never exceed the free chunks that could have been given back.
+        assert_eq!(reconcile_released(1100, 100, 200), 100);
+    }
+
+    #[test]
+    fn parses_rss_anon_from_proc_status() {
+        let body = "Name:\tuss-se\nVmRSS:\t  998456 kB\nRssAnon:\t  951000 kB\nRssFile:\t   47456 kB\n";
+        assert_eq!(parse_rss_anon_kb(body), Some(951_000));
+        assert_eq!(parse_rss_anon_kb("VmRSS:\t 10 kB\n"), None);
+    }
 }

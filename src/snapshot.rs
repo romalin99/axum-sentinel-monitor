@@ -31,10 +31,19 @@ pub struct ProcessStats {
 pub struct RuntimeStats {
     /// Tokio live tasks, or OS threads when no runtime is available.
     pub goroutines: u64,
+    /// Bytes handed out by the allocator and still in use.
     pub heap_alloc_bytes: u64,
+    /// Address space the allocator has obtained from the OS. On glibc this is
+    /// `mallinfo2().arena + hblkhd`, a high-water mark that `malloc_trim` does not
+    /// shrink; `heap_sys_bytes - heap_released_bytes` is the resident heap.
     pub heap_sys_bytes: u64,
+    /// Same as `heap_alloc_bytes` (Rust has no span-level in-use accounting).
     pub heap_inuse_bytes: u64,
+    /// Free chunks inside the heap (includes pages already returned to the OS).
     pub heap_idle_bytes: u64,
+    /// Heap pages the kernel no longer keeps resident (Go's `HeapReleased`). On glibc
+    /// it is derived as `heap_sys_bytes` minus `RssAnon`, so it moves with
+    /// `malloc_trim` / `MADV_DONTNEED` while `heap_sys_bytes` stays put.
     pub heap_released_bytes: u64,
     /// Tokio worker threads.
     pub workers: i32,

@@ -1551,6 +1551,7 @@
         ["Heap In-use", optional(runtime.heap_inuse_bytes, formatBytes)],
         ["Heap Idle", optional(runtime.heap_idle_bytes, formatBytes)],
         ["Heap Released", optional(runtime.heap_released_bytes, formatBytes)],
+        ["Heap Resident (Sys − Released)", finite(runtime.heap_sys_bytes) && finite(runtime.heap_released_bytes) ? formatBytes(Math.max(0, runtime.heap_sys_bytes - runtime.heap_released_bytes)) : "-"],
         ["Workers", optional(runtime.workers, integer.format)]
       ]);
     }

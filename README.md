@@ -113,6 +113,21 @@ configured refresh TTL. Process/system trend charts keep at most 60 poll samples
 Tokio runtime is available). `runtime.workers` is the Tokio worker count. Rust
 has no garbage collector, so GC metrics are not collected or shown.
 
+Heap figures follow Go's `runtime.MemStats` names. On Linux/glibc they come from
+`mallinfo2`: `heap_alloc_bytes` = `uordblks` (in use), `heap_idle_bytes` =
+`fordblks` (free chunks), `heap_sys_bytes` = `arena + hblkhd`. `heap_sys_bytes`
+is a high-water mark of address space the allocator obtained — `malloc_trim`
+returns pages with `MADV_DONTNEED` but never shrinks that number, so it cannot be
+compared with RSS directly. `heap_released_bytes` closes that gap: it is
+`heap_sys_bytes` minus the process's resident anonymous memory (`RssAnon` from
+`/proc/self/status`), clamped into `released <= idle <= sys`, i.e. the heap pages
+the kernel no longer keeps resident. `heap_sys_bytes - heap_released_bytes`
+(shown as **Heap Resident** in the Heap details) therefore tracks
+`process.rss_bytes` minus file-backed mappings, and drops after a trim. Because
+`RssAnon` also counts thread stacks and non-malloc anonymous mappings, released
+is a lower bound. On macOS the default zone statistics are used and
+`heap_released_bytes` is `0`; other targets report zeros.
+
 ## Security
 
 Runtime metrics can reveal process and host information. Do not expose the

@@ -1,8 +1,8 @@
 [package]
 name = "axum-sentinel-monitor"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.98.1"
 description = "A Fiber Monitor-style runtime dashboard for Axum"
 license = "MIT"
 repository = "https://github.com/romalin99/axum-sentinel-monitor"

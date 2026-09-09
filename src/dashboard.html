@@ -1232,6 +1232,7 @@
     const REFRESH_MS = __MONITOR_REFRESH_MS__;
     const MAX_SAMPLES = 60;
     const SAMPLE_WINDOWS = [30, 60];
+    const QPS_SMOOTH_SECS = 5;
     const dash = "\u2014";
     const history = {
       labels: [],
@@ -1523,6 +1524,30 @@
       return values.map((value) => finite(value) ? value : 0);
     }
 
+    function trailingMean(values, window) {
+      const span = Math.max(1, window | 0);
+      return values.map((value, index) => {
+        if (!finite(value)) return null;
+        let sum = 0;
+        let count = 0;
+        const start = Math.max(0, index - span + 1);
+        for (let cursor = start; cursor <= index; cursor += 1) {
+          if (!finite(values[cursor])) continue;
+          sum += values[cursor];
+          count += 1;
+        }
+        return count ? sum / count : null;
+      });
+    }
+
+    function chartQps(slice) {
+      const raw = slice.map((sample, index) => {
+        if (index === slice.length - 1) return null;
+        return finite(sample.requests) ? sample.requests : 0;
+      });
+      return trailingMean(raw, QPS_SMOOTH_SECS);
+    }
+
     function appendDetailRows(list, rows) {
       rows.forEach(([label, value]) => {
         const row = document.createElement("div");
@@ -1810,32 +1835,100 @@
       context.textBaseline = "alphabetic";
     }
 
-    function drawSeries(context, data, config) {
+    function plotPoint(data, index, value, config) {
       const plotWidth = config.width - config.padding.left - config.padding.right;
       const plotHeight = config.height - config.padding.top - config.padding.bottom;
+      const x = config.padding.left + (data.length === 1 ? plotWidth : index / (data.length - 1) * plotWidth);
+      const y = config.padding.top + (1 - (value - config.min) / (config.max - config.min || 1)) * plotHeight;
+      return { x, y };
+    }
+
+    function seriesSegments(data, config) {
+      const segments = [];
+      let current = [];
+      data.forEach((value, index) => {
+        if (!finite(value)) {
+          if (current.length) segments.push(current);
+          current = [];
+          return;
+        }
+        current.push(plotPoint(data, index, value, config));
+      });
+      if (current.length) segments.push(current);
+      return segments;
+    }
+
+    function strokeMonotone(context, points) {
+      if (points.length === 1) {
+        context.beginPath();
+        context.moveTo(points[0].x, points[0].y);
+        context.lineTo(points[0].x, points[0].y);
+        context.stroke();
+        return;
+      }
+      if (points.length === 2) {
+        context.beginPath();
+        context.moveTo(points[0].x, points[0].y);
+        context.lineTo(points[1].x, points[1].y);
+        context.stroke();
+        return;
+      }
+      const n = points.length;
+      const dx = [];
+      const dy = [];
+      const slope = [];
+      for (let i = 0; i < n - 1; i += 1) {
+        dx[i] = points[i + 1].x - points[i].x;
+        dy[i] = points[i + 1].y - points[i].y;
+      }
+      slope[0] = dy[0] / (dx[0] || 1);
+      slope[n - 1] = dy[n - 2] / (dx[n - 2] || 1);
+      for (let i = 1; i < n - 1; i += 1) {
+        if (!dy[i - 1] || !dy[i] || (dy[i - 1] > 0) !== (dy[i] > 0)) {
+          slope[i] = 0;
+        } else {
+          slope[i] = (dy[i - 1] / (dx[i - 1] || 1) + dy[i] / (dx[i] || 1)) / 2;
+        }
+      }
+      for (let i = 0; i < n - 1; i += 1) {
+        if (!dy[i] || !dx[i]) {
+          slope[i] = 0;
+          slope[i + 1] = 0;
+          continue;
+        }
+        const alpha = slope[i] * dx[i] / dy[i];
+        const beta = slope[i + 1] * dx[i] / dy[i];
+        const sum = alpha * alpha + beta * beta;
+        if (sum > 9) {
+          const tau = 3 / Math.sqrt(sum);
+          slope[i] = tau * alpha * dy[i] / dx[i];
+          slope[i + 1] = tau * beta * dy[i] / dx[i];
+        }
+      }
+      context.beginPath();
+      context.moveTo(points[0].x, points[0].y);
+      for (let i = 0; i < n - 1; i += 1) {
+        const handle = dx[i] / 3;
+        context.bezierCurveTo(
+          points[i].x + handle,
+          points[i].y + slope[i] * handle,
+          points[i + 1].x - handle,
+          points[i + 1].y - slope[i + 1] * handle,
+          points[i + 1].x,
+          points[i + 1].y
+        );
+      }
+      context.stroke();
+    }
+
+    function drawSeries(context, data, config) {
       if (!data.length) return;
       context.lineWidth = 2;
       context.strokeStyle = config.color;
       context.lineJoin = "round";
       context.lineCap = "round";
       context.setLineDash(Array.isArray(config.dash) ? config.dash : []);
-      let drawing = false;
-      context.beginPath();
-      data.forEach((value, index) => {
-        if (!finite(value)) {
-          drawing = false;
-          return;
-        }
-        const x = config.padding.left + (data.length === 1 ? plotWidth : index / (data.length - 1) * plotWidth);
-        const y = config.padding.top + (1 - (value - config.min) / (config.max - config.min || 1)) * plotHeight;
-        if (!drawing) {
-          context.moveTo(x, y);
-          drawing = true;
-        } else {
-          context.lineTo(x, y);
-        }
-      });
-      context.stroke();
+      seriesSegments(data, config).forEach((points) => strokeMonotone(context, points));
       context.setLineDash([]);
     }
 
@@ -1899,7 +1992,7 @@
         return Number.isNaN(date.getTime()) ? "Sample" : date.toLocaleTimeString();
       });
       drawLineChart(byId("request-chart"), [
-        { name: "QPS", data: slice.map((sample) => finite(sample.requests) ? sample.requests : 0), color: accent }
+        { name: "QPS", data: chartQps(slice), color: accent }
       ], { minValue: 0, unit: "req/s", labels: httpLabels });
       const p50 = slice.map((sample) => finite(sample.p50_ns) ? sample.p50_ns : null);
       const p95 = slice.map((sample) => finite(sample.p95_ns) ? sample.p95_ns : null);

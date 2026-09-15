@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
@@ -11,7 +11,7 @@ use crate::snapshot::Snapshot;
 
 pub(crate) struct SharedStats {
     http: HttpMetrics,
-    collect: Mutex<CollectState>,
+    collect: RwLock<CollectState>,
     refresh: Duration,
 }
 
@@ -21,7 +21,7 @@ struct CollectState {
 }
 
 struct CacheEntry {
-    snapshot: Snapshot,
+    snapshot: Arc<Snapshot>,
     cached_at: Instant,
 }
 
@@ -41,7 +41,7 @@ impl SharedStats {
     pub(crate) fn new(refresh: Duration) -> Arc<Self> {
         Arc::new(Self {
             http: HttpMetrics::new(),
-            collect: Mutex::new(CollectState {
+            collect: RwLock::new(CollectState {
                 collector: Collector::new(),
                 cache: None,
             }),
@@ -54,18 +54,37 @@ impl SharedStats {
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot {
+        Arc::unwrap_or_clone(self.snapshot_arc())
+    }
+
+    pub(crate) fn cached_snapshot(&self) -> Option<Arc<Snapshot>> {
+        let state = self
+            .collect
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .cache
+            .as_ref()
+            .filter(|entry| entry.cached_at.elapsed() < self.refresh)
+            .map(|entry| Arc::clone(&entry.snapshot))
+    }
+
+    pub(crate) fn snapshot_arc(&self) -> Arc<Snapshot> {
+        if let Some(snapshot) = self.cached_snapshot() {
+            return snapshot;
+        }
         let mut state = self
             .collect
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(entry) = &state.cache
             && entry.cached_at.elapsed() < self.refresh
         {
-            return entry.snapshot.clone();
+            return Arc::clone(&entry.snapshot);
         }
-        let snapshot = state.collector.collect(&self.http);
+        let snapshot = Arc::new(state.collector.collect(&self.http));
         state.cache = Some(CacheEntry {
-            snapshot: snapshot.clone(),
+            snapshot: Arc::clone(&snapshot),
             cached_at: Instant::now(),
         });
         snapshot
@@ -99,8 +118,9 @@ impl HttpMetrics {
         self.record_status(status);
         let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let class = (status.as_u16() / 100) as u8;
-        self.latency.observe(ns, class);
-        self.endpoints.observe(route, ns, class);
+        let tick = self.latency.current_tick();
+        self.latency.observe_at(tick, ns, class);
+        self.endpoints.observe(route, tick, ns, class);
     }
 
     fn record_status(&self, status: StatusCode) {
@@ -151,7 +171,11 @@ impl HttpMetrics {
     }
 
     pub(crate) fn end_in_flight(&self, route: &RouteHandle) {
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_sub(1)
+            });
         route.end();
     }
 }
@@ -164,5 +188,20 @@ pub(crate) struct InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.stats.http.end_in_flight(&self.route);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_flight_decrement_saturates_at_zero() {
+        let stats = SharedStats::new(Duration::from_secs(1));
+        let route = stats.http.begin_request("GET", "/");
+        stats.http.end_in_flight(&route);
+        stats.http.end_in_flight(&route);
+        assert_eq!(stats.http.in_flight(), 0);
+        assert_eq!(stats.http.endpoints().snapshot()[0].in_flight, 0);
     }
 }

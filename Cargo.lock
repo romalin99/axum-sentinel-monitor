@@ -93,6 +93,7 @@ dependencies = [
  "chrono",
  "http-body-util",
  "num_threads",
+ "pin-project-lite",
  "serde",
  "sonic-rs",
  "sysinfo",

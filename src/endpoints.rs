@@ -96,18 +96,18 @@ impl EndpointSet {
         RouteHandle(metrics)
     }
 
-    pub(crate) fn observe(&self, route: &RouteHandle, ns: u64, status_class: u8) {
+    pub(crate) fn observe(&self, route: &RouteHandle, tick: u64, ns: u64, status_class: u8) {
         route
             .0
             .last_observe
-            .store(self.tick().saturating_add(1), Ordering::Relaxed);
-        route.0.window.observe(ns, status_class);
+            .store(tick.saturating_add(1), Ordering::Relaxed);
+        route.0.window.observe_at(tick, ns, status_class);
     }
 
     #[cfg(test)]
     fn observe_path(&self, method: &str, path: &str, ns: u64, status_class: u8) {
         let route = RouteHandle(self.route_metrics(method, path));
-        self.observe(&route, ns, status_class);
+        self.observe(&route, self.tick(), ns, status_class);
     }
 
     fn tick(&self) -> u64 {
@@ -115,21 +115,34 @@ impl EndpointSet {
     }
 
     pub(crate) fn snapshot(&self) -> Vec<EndpointTraffic> {
-        let routes = self
-            .routes
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tick = self.tick();
+        let routes: Vec<_> = {
+            let routes = self
+                .routes
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            routes
+                .iter()
+                .map(|(key, metrics)| {
+                    let (method, path) = split_key(key);
+                    (method.to_owned(), path.to_owned(), Arc::clone(metrics))
+                })
+                .collect()
+        };
         let mut rows: Vec<EndpointTraffic> = routes
-            .iter()
-            .map(|(key, metrics)| {
-                let traffic = metrics.window.snapshot();
-                let (method, path) = split_key(key);
+            .into_iter()
+            .map(|(method, path, metrics)| {
+                let (window_30, window_60) = if metrics.is_cold(tick) {
+                    SlidingWindow::empty_windows(tick)
+                } else {
+                    metrics.window.snapshot_windows_at(tick)
+                };
                 EndpointTraffic {
-                    method: method.to_owned(),
-                    path: path.to_owned(),
+                    method,
+                    path,
                     in_flight: metrics.in_flight.load(Ordering::Relaxed),
-                    window_30: traffic.window_30,
-                    window_60: traffic.window_60,
+                    window_30,
+                    window_60,
                 }
             })
             .collect();
@@ -213,10 +226,7 @@ fn evict_one(routes: &mut HashMap<RouteKey, Arc<RouteMetrics>>, tick: u64) -> bo
         } else {
             &mut warm
         };
-        if group
-            .as_ref()
-            .is_none_or(|(_, oldest)| last_used < *oldest)
-        {
+        if group.as_ref().is_none_or(|(_, oldest)| last_used < *oldest) {
             *group = Some((key.clone(), last_used));
         }
     }
@@ -303,25 +313,27 @@ fn write_normalized_path(out: &mut String, path: &str) {
 }
 
 fn is_route_param(segment: &str) -> bool {
-    (segment.starts_with('{') && segment.ends_with('}') && segment.len() >= 3)
-        || (segment.starts_with(':') && segment.len() > 1)
+    let bytes = segment.as_bytes();
+    (bytes.len() >= 3 && bytes[0] == b'{' && bytes[bytes.len() - 1] == b'}')
+        || (bytes.len() > 1 && bytes[0] == b':')
 }
 
 fn looks_like_id(segment: &str) -> bool {
-    if segment.is_empty() {
+    let bytes = segment.as_bytes();
+    if bytes.is_empty() {
         return false;
     }
-    if segment.chars().all(|ch| ch.is_ascii_digit()) {
+    if bytes.iter().all(u8::is_ascii_digit) {
         return true;
     }
-    let dash = segment.bytes().filter(|byte| *byte == b'-').count();
-    if segment.len() == 36 && dash == 4 {
-        return segment
-            .chars()
-            .all(|ch| ch.is_ascii_hexdigit() || ch == '-');
+    let dash = bytes.iter().filter(|byte| **byte == b'-').count();
+    if bytes.len() == 36 && dash == 4 {
+        return bytes
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit() || *byte == b'-');
     }
-    let len = segment.len();
-    (8..=32).contains(&len) && segment.chars().all(|ch| ch.is_ascii_hexdigit())
+    let len = bytes.len();
+    (8..=32).contains(&len) && bytes.iter().all(u8::is_ascii_hexdigit)
 }
 
 #[cfg(test)]
@@ -447,7 +459,10 @@ mod tests {
         hold.end();
         let idle = set.snapshot();
         assert_eq!(
-            idle.iter().find(|row| row.path == "/hold").unwrap().in_flight,
+            idle.iter()
+                .find(|row| row.path == "/hold")
+                .unwrap()
+                .in_flight,
             0
         );
     }
@@ -470,7 +485,11 @@ mod tests {
         extra.end();
         let drained = set.snapshot();
         assert_eq!(
-            drained.iter().find(|row| row.path == "/...").unwrap().in_flight,
+            drained
+                .iter()
+                .find(|row| row.path == "/...")
+                .unwrap()
+                .in_flight,
             0
         );
     }
@@ -497,5 +516,34 @@ mod tests {
         assert!(!paths.iter().any(|path| path == "/stale"));
         // The true LRU row survives because a cold row outranks it for eviction.
         assert!(paths.iter().any(|path| path == "/route-0"));
+    }
+
+    #[test]
+    fn concurrent_registration_creates_one_route() {
+        const THREADS: usize = 16;
+        let set = Arc::new(EndpointSet::with_clock(
+            Instant::now(),
+            Arc::new(AtomicU64::new(0)),
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let set = Arc::clone(&set);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    set.begin("GET", "/shared").end();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let routes = set
+            .routes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(routes.len(), 1);
+        assert!(routes.contains_key("GET /shared"));
     }
 }

@@ -85,7 +85,7 @@ requests are not included in HTTP metrics.
 | `description` | Live process, runtime, system, and HTTP metrics… | Text below the heading |
 | `footer` | `Powered by axum-sentinel-monitor.` | Footer text |
 | `favicon_url` | Built-in SVG | Root-relative path or absolute HTTP(S) URL |
-| `refresh` | 3 seconds | Browser polling interval and snapshot cache TTL; values below 1s are clamped |
+| `refresh` | 3 seconds | Visible-page polling interval and snapshot cache TTL; values below 1s are clamped |
 | `api_only` | `false` | Always return JSON |
 | `custom_head` | empty | Deprecated; ignored by the embedded dashboard |
 | `font_url` | Google Fonts Roboto | Deprecated; no external font is loaded |
@@ -107,7 +107,15 @@ Unsupported, failed, and not-yet-available process/system window metrics are enc
 not as a synthetic zero. CPU and network rates need two collection windows; their first snapshot is `null`. HTTP QPS is `0` until the first completed request, and latency percentiles are `null` while the selected window has no samples.
 
 Snapshots are collected only when JSON is requested and are shared within the
-configured refresh TTL. Process/system trend charts keep at most 60 poll samples in the browser. HTTP charts are drawn from `http.series` (oldest-first, 60 one-second points) so a newly opened dashboard already shows the last minute.
+configured refresh TTL. Frequent programmatic consumers can call
+`Monitor::snapshot_arc()` to avoid cloning the HTTP series and endpoint rows.
+Encoded JSON is also reused for that snapshot. Hidden
+dashboard tabs throttle polling to 30 seconds and refresh immediately when made
+visible. Process/system trend charts keep at most 60 poll samples in the browser.
+HTTP charts are drawn from `http.series` (oldest-first, 60 one-second points) so
+a newly opened dashboard already shows the last minute. File-descriptor counts
+are sampled at most every 5 seconds and filesystem usage every 30 seconds to keep
+those comparatively expensive probes off the frequent collection path.
 
 `runtime.goroutines` is the number of live Tokio tasks (or OS threads when no
 Tokio runtime is available). `runtime.workers` is the Tokio worker count. Rust

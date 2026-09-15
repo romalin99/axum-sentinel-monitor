@@ -20,21 +20,22 @@ mod layer;
 mod snapshot;
 mod stats;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     Router,
+    body::Bytes,
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE},
     },
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::any,
 };
 
 pub use config::{Config, HTTP_WINDOW, MIN_REFRESH};
 pub use json::{SonicJson, SonicJsonRejection};
-pub use layer::{MonitorLayer, MonitorService};
+pub use layer::{MonitorFuture, MonitorLayer, MonitorService};
 pub use snapshot::{
     CollectionStats, HttpEndpointStats, HttpRateStats, HttpSecondSample, HttpStats,
     HttpStatusStats, HttpWindowStats, HttpWindows, LatencyStats, ProcessStats, RuntimeStats,
@@ -46,6 +47,13 @@ pub use snapshot::{
 pub struct Monitor {
     config: Arc<Config>,
     stats: Arc<stats::SharedStats>,
+    dashboard: Bytes,
+    encoded: Arc<Mutex<Option<EncodedSnapshot>>>,
+}
+
+struct EncodedSnapshot {
+    source: Arc<Snapshot>,
+    body: Bytes,
 }
 
 impl Default for Monitor {
@@ -59,7 +67,17 @@ impl Monitor {
     pub fn new(config: Config) -> Self {
         let config = Arc::new(config.normalized());
         let stats = stats::SharedStats::new(config.refresh);
-        Self { config, stats }
+        let dashboard = if config.api_only {
+            Bytes::new()
+        } else {
+            Bytes::from(dashboard::render(&config))
+        };
+        Self {
+            config,
+            stats,
+            dashboard,
+            encoded: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Returns a router exposing the configured monitor route.
@@ -83,7 +101,7 @@ impl Monitor {
     pub fn layer(&self) -> MonitorLayer {
         MonitorLayer {
             stats: Arc::clone(&self.stats),
-            skip_path: self.config.route.clone(),
+            skip_path: Arc::from(self.config.route.as_str()),
         }
     }
 
@@ -97,21 +115,33 @@ impl Monitor {
         self.stats()
     }
 
+    /// Returns a shared snapshot without cloning its HTTP series and endpoint rows.
+    ///
+    /// Prefer this over [`Self::snapshot`] for frequent programmatic polling.
+    pub fn snapshot_arc(&self) -> Arc<Snapshot> {
+        self.stats.snapshot_arc()
+    }
+
     /// Returns the normalized monitor configuration.
     pub fn config(&self) -> &Config {
         &self.config
     }
 
-    /// Collecting a snapshot makes blocking syscalls (process, network and disk
-    /// probes), so it runs on the blocking pool instead of stalling the worker
-    /// serving this request.
-    async fn collect_snapshot(&self) -> Snapshot {
+    /// Cold collection and serialization run on the blocking pool. Cache hits
+    /// return shared encoded bytes without scheduling another blocking task.
+    async fn collect_json(&self) -> Result<Bytes, String> {
+        if let Some(snapshot) = self.stats.cached_snapshot() {
+            return encode_snapshot(&self.encoded, snapshot);
+        }
         let stats = Arc::clone(&self.stats);
-        match tokio::task::spawn_blocking(move || stats.snapshot()).await {
-            Ok(snapshot) => snapshot,
+        let encoded = Arc::clone(&self.encoded);
+        match tokio::task::spawn_blocking(move || encode_snapshot(&encoded, stats.snapshot_arc()))
+            .await
+        {
+            Ok(body) => body,
             // The blocking pool is gone (runtime shutting down); collect inline
             // rather than failing the request.
-            Err(_) => self.stats.snapshot(),
+            Err(_) => encode_snapshot(&self.encoded, self.stats.snapshot_arc()),
         }
     }
 
@@ -127,22 +157,33 @@ impl Monitor {
         let wants_json = self.config.api_only || prefers_json(&headers);
 
         let mut response = if wants_json {
-            SonicJson(self.collect_snapshot().await).into_response()
+            match self.collect_json().await {
+                Ok(body) => {
+                    let mut response = body.into_response();
+                    response.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/json; charset=utf-8"),
+                    );
+                    response
+                }
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/plain; charset=utf-8"),
+                    )],
+                    error,
+                )
+                    .into_response(),
+            }
         } else {
-            Html(dashboard::render(&self.config)).into_response()
-        };
-
-        if wants_json {
-            response.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("application/json; charset=utf-8"),
-            );
-        } else {
+            let mut response = self.dashboard.clone().into_response();
             response.headers_mut().insert(
                 CONTENT_TYPE,
                 HeaderValue::from_static("text/html; charset=utf-8"),
             );
-        }
+            response
+        };
         response
             .headers_mut()
             .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -152,6 +193,28 @@ impl Monitor {
         );
         response
     }
+}
+
+fn encode_snapshot(
+    cache: &Mutex<Option<EncodedSnapshot>>,
+    snapshot: Arc<Snapshot>,
+) -> Result<Bytes, String> {
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(encoded) = cache.as_ref()
+        && Arc::ptr_eq(&encoded.source, &snapshot)
+    {
+        return Ok(encoded.body.clone());
+    }
+    let body = sonic_rs::to_vec(&*snapshot)
+        .map(Bytes::from)
+        .map_err(|error| error.to_string())?;
+    *cache = Some(EncodedSnapshot {
+        source: snapshot,
+        body: body.clone(),
+    });
+    Ok(body)
 }
 
 fn prefers_json(headers: &HeaderMap) -> bool {
@@ -221,7 +284,7 @@ mod tests {
     };
     use http_body_util::BodyExt;
     use sonic_rs::{JsonContainerTrait, JsonValueTrait};
-    use tower::ServiceExt;
+    use tower::{Service, ServiceExt};
 
     use super::*;
 
@@ -406,6 +469,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_unpolled_request_releases_in_flight() {
+        let monitor = Monitor::default();
+        let mut app = Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .layer(monitor.layer());
+        let future = Service::<Request<Body>>::call(
+            &mut app,
+            Request::get("/x").body(Body::empty()).unwrap(),
+        );
+        drop(future);
+        assert_eq!(monitor.snapshot().http.in_flight, 0);
+    }
+
+    #[tokio::test]
     async fn monitor_endpoint_is_not_application_traffic() {
         let monitor = Monitor::default();
         let app = monitor.router().layer(monitor.layer());
@@ -444,5 +521,16 @@ mod tests {
         assert!(prefers_json(&headers));
         headers.insert(ACCEPT, "application/json;q=0, */*;q=1".parse().unwrap());
         assert!(!prefers_json(&headers));
+    }
+
+    #[test]
+    fn reuses_encoded_snapshot_bytes_within_cache_ttl() {
+        let monitor = Monitor::default();
+        let snapshot = monitor.snapshot_arc();
+        assert!(Arc::ptr_eq(&snapshot, &monitor.snapshot_arc()));
+        let first = encode_snapshot(&monitor.encoded, Arc::clone(&snapshot)).unwrap();
+        let second = encode_snapshot(&monitor.encoded, snapshot).unwrap();
+        assert_eq!(first.as_ptr(), second.as_ptr());
+        assert_eq!(first.len(), second.len());
     }
 }

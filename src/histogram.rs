@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const WINDOW_SECS: u64 = 60;
@@ -10,8 +10,10 @@ const SUB: u64 = 1 << SUB_BITS;
 const MAX_LATENCY_NS: u64 = 60_000_000_000;
 const MAX_LOG: u32 = 36;
 const BUCKETS: usize = SUB as usize + ((MAX_LOG - SUB_BITS) as usize) * SUB as usize;
+const TICK_EMPTY: u64 = u64::MAX;
+const TICK_RESETTING: u64 = u64::MAX - 1;
+const PERCENTILES: [u32; 4] = [500, 950, 990, 999];
 
-#[derive(Clone)]
 struct LatencyHist {
     buckets: [u64; BUCKETS],
     count: u64,
@@ -35,43 +37,67 @@ impl LatencyHist {
         self.count += count;
     }
 
-    fn percentile(&self, permille: u32) -> Option<u64> {
-        if self.count == 0 || permille == 0 {
-            return None;
+    fn add_from(&mut self, other: &Self) {
+        if other.count == 0 {
+            return;
         }
-        let rank = (u128::from(self.count) * u128::from(permille)).div_ceil(1000) as u64;
-        let rank = rank.max(1);
+        self.count += other.count;
+        for (dst, src) in self.buckets.iter_mut().zip(&other.buckets) {
+            if *src != 0 {
+                *dst += *src;
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        if self.count == 0 {
+            return;
+        }
+        self.buckets.fill(0);
+        self.count = 0;
+    }
+
+    fn percentiles(&self) -> [Option<u64>; PERCENTILES.len()] {
+        if self.count == 0 {
+            return [None; PERCENTILES.len()];
+        }
+        let ranks = PERCENTILES.map(|permille| {
+            ((u128::from(self.count) * u128::from(permille)).div_ceil(1000) as u64).max(1)
+        });
+        let mut values = [None; PERCENTILES.len()];
+        let mut next = 0;
         let mut cumulative = 0;
         for (index, count) in self.buckets.iter().enumerate() {
             cumulative += count;
-            if cumulative >= rank {
-                return Some(bucket_upper_ns(index));
+            while next < ranks.len() && cumulative >= ranks[next] {
+                values[next] = Some(bucket_upper_ns(index));
+                next += 1;
+            }
+            if next == ranks.len() {
+                break;
             }
         }
-        Some(MAX_LATENCY_NS)
+        for value in &mut values[next..] {
+            *value = Some(MAX_LATENCY_NS);
+        }
+        values
     }
 }
 
 struct Slot {
     tick: AtomicU64,
-    requests: AtomicU64,
-    status: [AtomicU64; 5],
-    buckets: [AtomicU64; BUCKETS],
-}
-
-struct SlotView {
-    requests: u64,
-    status: [u64; 5],
-    hist: LatencyHist,
+    requests: AtomicU32,
+    status: [AtomicU32; 5],
+    buckets: [AtomicU32; BUCKETS],
 }
 
 impl Slot {
     fn new() -> Self {
         Self {
-            tick: AtomicU64::new(u64::MAX),
-            requests: AtomicU64::new(0),
-            status: std::array::from_fn(|_| AtomicU64::new(0)),
-            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            tick: AtomicU64::new(TICK_EMPTY),
+            requests: AtomicU32::new(0),
+            status: std::array::from_fn(|_| AtomicU32::new(0)),
+            buckets: std::array::from_fn(|_| AtomicU32::new(0)),
         }
     }
 
@@ -85,22 +111,27 @@ impl Slot {
         }
     }
 
-    fn load_if_tick(&self, tick: u64) -> Option<SlotView> {
-        if self.tick.load(Ordering::Acquire) != tick {
+    /// Loads this slot when it still belongs to `expected_tick`. Empty seconds
+    /// skip the 272-bucket walk. `hist` is always reset before returning.
+    fn read(&self, expected_tick: u64, hist: &mut LatencyHist) -> Option<(u64, [u64; 5])> {
+        hist.reset();
+        if self.tick.load(Ordering::Acquire) != expected_tick {
             return None;
         }
-        let mut hist = LatencyHist::default();
+        let requests = u64::from(self.requests.load(Ordering::Relaxed));
+        if requests == 0 {
+            return (self.tick.load(Ordering::Acquire) == expected_tick).then_some((0, [0; 5]));
+        }
+        let status =
+            std::array::from_fn(|index| u64::from(self.status[index].load(Ordering::Relaxed)));
         for (index, bucket) in self.buckets.iter().enumerate() {
-            hist.add_bucket(index, bucket.load(Ordering::Relaxed));
+            hist.add_bucket(index, u64::from(bucket.load(Ordering::Relaxed)));
         }
-        if self.tick.load(Ordering::Acquire) != tick {
+        if self.tick.load(Ordering::Acquire) != expected_tick {
+            hist.reset();
             return None;
         }
-        Some(SlotView {
-            requests: self.requests.load(Ordering::Relaxed),
-            status: std::array::from_fn(|index| self.status[index].load(Ordering::Relaxed)),
-            hist,
-        })
+        Some((requests, status))
     }
 }
 
@@ -162,63 +193,141 @@ impl SlidingWindow {
         Arc::clone(&self.extra_secs)
     }
 
+    #[cfg(test)]
     pub(crate) fn observe(&self, ns: u64, status_class: u8) {
-        let tick = self.tick();
-        let slot = self.slot_for(tick);
-        slot.requests.fetch_add(1, Ordering::Relaxed);
-        if (1..=5).contains(&status_class) {
-            slot.status[(status_class - 1) as usize].fetch_add(1, Ordering::Relaxed);
-        }
+        self.observe_at(self.current_tick(), ns, status_class);
+    }
+
+    pub(crate) fn observe_at(&self, tick: u64, ns: u64, status_class: u8) {
         let index = bucket_of(ns);
+        let status = (1..=5)
+            .contains(&status_class)
+            .then_some((status_class - 1) as usize);
+        let Some(slot) = self.slot_for(tick) else {
+            return;
+        };
+        if slot.tick.load(Ordering::Acquire) != tick {
+            return;
+        }
+        slot.requests.fetch_add(1, Ordering::Relaxed);
+        if let Some(class) = status {
+            slot.status[class].fetch_add(1, Ordering::Relaxed);
+        }
         slot.buckets[index].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn snapshot(&self) -> TrafficSnapshot {
-        let tick = self.tick();
-        let unix = unix_now();
-        let mut loaded = Vec::with_capacity(WINDOW_SECS as usize);
-        let mut series = Vec::with_capacity(WINDOW_SECS as usize);
+        self.fold(true, self.current_tick())
+    }
+
+    /// 30s/60s aggregates without the 60-point series or per-second percentiles.
+    #[cfg(test)]
+    pub(crate) fn snapshot_windows(&self) -> (WindowAgg, WindowAgg) {
+        self.snapshot_windows_at(self.current_tick())
+    }
+
+    pub(crate) fn snapshot_windows_at(&self, tick: u64) -> (WindowAgg, WindowAgg) {
+        let folded = self.fold(false, tick);
+        (folded.window_30, folded.window_60)
+    }
+
+    pub(crate) fn empty_windows(tick: u64) -> (WindowAgg, WindowAgg) {
+        let hist = LatencyHist::default();
+        (
+            finish_agg(WINDOW_30_SECS, tick, 0, [0; 5], &hist),
+            finish_agg(WINDOW_SECS, tick, 0, [0; 5], &hist),
+        )
+    }
+
+    fn fold(&self, with_series: bool, tick: u64) -> TrafficSnapshot {
+        let unix = if with_series { unix_now() } else { 0 };
+        let mut hist_30 = LatencyHist::default();
+        let mut hist_60 = LatencyHist::default();
+        let mut slot_hist = LatencyHist::default();
+        let mut status_30 = [0u64; 5];
+        let mut status_60 = [0u64; 5];
+        let mut requests_30 = 0u64;
+        let mut requests_60 = 0u64;
+        let mut series = Vec::with_capacity(if with_series { WINDOW_SECS as usize } else { 0 });
+
         for age in (0..WINDOW_SECS).rev() {
-            let unix_secs = unix.saturating_sub(age as i64);
-            let slot = if tick < age {
+            let loaded = if tick < age {
                 None
             } else {
                 let slot_tick = tick - age;
-                self.slots[(slot_tick % WINDOW_SECS) as usize].load_if_tick(slot_tick)
+                self.slots[(slot_tick % WINDOW_SECS) as usize].read(slot_tick, &mut slot_hist)
             };
-            series.push(sample_from(unix_secs, slot.as_ref()));
-            loaded.push(slot);
+
+            if with_series {
+                let unix_secs = unix.saturating_sub(age as i64);
+                series.push(match &loaded {
+                    Some((requests, status)) => {
+                        let [p50_ns, p95_ns, p99_ns, p999_ns] = slot_hist.percentiles();
+                        SecondSample {
+                            unix_secs,
+                            requests: *requests,
+                            status: *status,
+                            p50_ns,
+                            p95_ns,
+                            p99_ns,
+                            p999_ns,
+                        }
+                    }
+                    None => empty_sample(unix_secs),
+                });
+            }
+
+            let Some((requests, status)) = loaded else {
+                continue;
+            };
+            if requests == 0 {
+                continue;
+            }
+            requests_60 += requests;
+            add_status(&mut status_60, status);
+            hist_60.add_from(&slot_hist);
+            if age < WINDOW_30_SECS {
+                requests_30 += requests;
+                add_status(&mut status_30, status);
+                hist_30.add_from(&slot_hist);
+            }
         }
+
         TrafficSnapshot {
-            window_30: aggregate_loaded(&loaded, WINDOW_30_SECS, tick),
-            window_60: aggregate_loaded(&loaded, WINDOW_SECS, tick),
+            window_30: finish_agg(WINDOW_30_SECS, tick, requests_30, status_30, &hist_30),
+            window_60: finish_agg(WINDOW_SECS, tick, requests_60, status_60, &hist_60),
             series,
         }
     }
 
-    fn slot_for(&self, tick: u64) -> &Slot {
+    fn slot_for(&self, tick: u64) -> Option<&Slot> {
         let slot = &self.slots[(tick % WINDOW_SECS) as usize];
         loop {
             let current = slot.tick.load(Ordering::Acquire);
             if current == tick {
-                return slot;
+                return Some(slot);
             }
-            if current < tick || current == u64::MAX {
+            if current == TICK_RESETTING {
+                std::hint::spin_loop();
+                continue;
+            }
+            if current < tick || current == TICK_EMPTY {
                 if slot
                     .tick
-                    .compare_exchange(current, tick, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(current, TICK_RESETTING, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
                     slot.clear();
-                    return slot;
+                    slot.tick.store(tick, Ordering::Release);
+                    return Some(slot);
                 }
                 continue;
             }
-            return slot;
+            return None;
         }
     }
 
-    fn tick(&self) -> u64 {
+    pub(crate) fn current_tick(&self) -> u64 {
         self.origin.elapsed().as_secs() + self.extra_secs.load(Ordering::Relaxed)
     }
 
@@ -228,51 +337,31 @@ impl SlidingWindow {
     }
 }
 
-fn sample_from(unix_secs: i64, slot: Option<&SlotView>) -> SecondSample {
-    let Some(slot) = slot else {
-        return empty_sample(unix_secs);
-    };
-    SecondSample {
-        unix_secs,
-        requests: slot.requests,
-        status: slot.status,
-        p50_ns: slot.hist.percentile(500),
-        p95_ns: slot.hist.percentile(950),
-        p99_ns: slot.hist.percentile(990),
-        p999_ns: slot.hist.percentile(999),
-    }
-}
-
-fn aggregate_loaded(loaded: &[Option<SlotView>], window: u64, tick: u64) -> WindowAgg {
+fn finish_agg(
+    window: u64,
+    tick: u64,
+    requests: u64,
+    status: [u64; 5],
+    hist: &LatencyHist,
+) -> WindowAgg {
     let covered = tick.saturating_add(1).min(window).max(1);
-    let start = loaded.len().saturating_sub(window as usize);
-    let mut requests = 0;
-    let mut status = [0u64; 5];
-    let mut hist = LatencyHist::default();
-    for slot in &loaded[start..] {
-        let Some(slot) = slot else {
-            continue;
-        };
-        requests += slot.requests;
-        for (dst, src) in status.iter_mut().zip(slot.status) {
-            *dst += src;
-        }
-        hist.buckets
-            .iter_mut()
-            .zip(slot.hist.buckets)
-            .for_each(|(dst, src)| *dst += src);
-        hist.count += slot.hist.count;
-    }
+    let [p50_ns, p95_ns, p99_ns, p999_ns] = hist.percentiles();
     WindowAgg {
         seconds: window as u32,
         covered_seconds: covered as u32,
         requests,
         rps: requests as f64 / covered as f64,
         status,
-        p50_ns: hist.percentile(500),
-        p95_ns: hist.percentile(950),
-        p99_ns: hist.percentile(990),
-        p999_ns: hist.percentile(999),
+        p50_ns,
+        p95_ns,
+        p99_ns,
+        p999_ns,
+    }
+}
+
+fn add_status(dst: &mut [u64; 5], src: [u64; 5]) {
+    for (dst, src) in dst.iter_mut().zip(src) {
+        *dst += src;
     }
 }
 
@@ -337,6 +426,7 @@ pub(crate) fn window_rates(status: &[u64; 5], requests: u64) -> (Option<f64>, Op
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::*;
@@ -410,5 +500,50 @@ mod tests {
         assert_eq!(snap.window_60.requests, 2);
         assert_eq!(snap.window_60.status[1], 1);
         assert_eq!(snap.window_60.status[3], 1);
+    }
+
+    #[test]
+    fn windows_match_full_snapshot_without_building_series() {
+        let window = SlidingWindow::new();
+        window.observe(1_000_000, 2);
+        window.advance_secs(31);
+        window.observe(2_000_000, 4);
+        let snap = window.snapshot();
+        let (window_30, window_60) = window.snapshot_windows();
+        assert_eq!(window_30.requests, snap.window_30.requests);
+        assert_eq!(window_30.status, snap.window_30.status);
+        assert_eq!(window_30.p50_ns, snap.window_30.p50_ns);
+        assert_eq!(window_60.requests, snap.window_60.requests);
+        assert_eq!(window_60.status, snap.window_60.status);
+        assert_eq!(window_60.p999_ns, snap.window_60.p999_ns);
+        assert!(window.snapshot_windows().0.seconds == 30);
+    }
+
+    #[test]
+    fn concurrent_observers_do_not_lose_samples() {
+        const THREADS: usize = 8;
+        const SAMPLES: usize = 10_000;
+        let window = Arc::new(SlidingWindow::new());
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let window = Arc::clone(&window);
+                std::thread::spawn(move || {
+                    for _ in 0..SAMPLES {
+                        window.observe(1_000_000, 2);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let snapshot = window.snapshot();
+        assert_eq!(snapshot.window_60.requests, (THREADS * SAMPLES) as u64);
+        assert_eq!(snapshot.window_60.status[1], (THREADS * SAMPLES) as u64);
+    }
+
+    #[test]
+    fn slot_layout_stays_compact() {
+        assert!(std::mem::size_of::<Slot>() <= 1_152);
     }
 }

@@ -21,6 +21,11 @@ use crate::stats::HttpMetrics;
 /// too slowly to be worth that on every dashboard poll.
 const DISK_TTL: Duration = Duration::from_secs(30);
 
+/// Open-descriptor listing walks `/proc/self/fd` (or `/dev/fd`), so the cost
+/// grows with connection count. The figure is stable enough to share across
+/// several dashboard polls.
+const FD_TTL: Duration = Duration::from_secs(5);
+
 pub(crate) struct Collector {
     system: System,
     networks: Networks,
@@ -28,6 +33,8 @@ pub(crate) struct Collector {
     disk_root: Option<PathBuf>,
     disk_cache: Option<DiskUsage>,
     disk_at: Option<Instant>,
+    fd_cache: Option<i32>,
+    fd_at: Option<Instant>,
     pid: Pid,
     num_cpu: usize,
     started: Instant,
@@ -60,6 +67,8 @@ impl Collector {
             disk_root,
             disk_cache: None,
             disk_at: None,
+            fd_cache: None,
+            fd_at: None,
             pid: Pid::from_u32(std::process::id()),
             num_cpu: 1,
             started: now,
@@ -129,7 +138,7 @@ impl Collector {
             None => errors.push("process.threads".into()),
         }
 
-        match open_descriptors() {
+        match self.cached_descriptors() {
             Some(count) => stats.open_descriptors = Some(count),
             None => errors.push("process.descriptors".into()),
         }
@@ -325,6 +334,18 @@ impl Collector {
         usage
     }
 
+    fn cached_descriptors(&mut self) -> Option<i32> {
+        if let Some(at) = self.fd_at
+            && at.elapsed() < FD_TTL
+        {
+            return self.fd_cache;
+        }
+        let count = open_descriptors();
+        self.fd_at = Some(Instant::now());
+        self.fd_cache = count;
+        count
+    }
+
     fn read_disk(&self) -> Option<DiskUsage> {
         let root = self.disk_root.as_deref()?;
         let disk = self
@@ -350,12 +371,7 @@ impl Collector {
 }
 
 fn path_on_mount(path: &Path, mount: &Path) -> bool {
-    let mount = if mount.as_os_str().is_empty() {
-        PathBuf::from(mount)
-    } else {
-        mount.to_path_buf()
-    };
-    path.starts_with(&mount)
+    path.starts_with(mount)
 }
 
 fn collect_runtime() -> RuntimeStats {
@@ -484,7 +500,10 @@ fn allocator_stats() -> AllocatorStats {
 /// `resident` is RssAnon, which also counts thread stacks and non-malloc anonymous
 /// mappings, so the result is a lower bound: a few MB of stacks read as "still
 /// resident heap". On a trimmed process the error is small next to the pages returned.
-#[cfg(any(all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"), test))]
+#[cfg(any(
+    all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"),
+    test
+))]
 fn reconcile_released(sys_bytes: u64, idle_bytes: u64, resident_anonymous: u64) -> u64 {
     sys_bytes
         .saturating_sub(resident_anonymous)
@@ -500,7 +519,10 @@ fn resident_anonymous_bytes() -> Option<u64> {
 }
 
 /// Pull the `RssAnon:` value (kB) out of a `/proc/<pid>/status` body.
-#[cfg(any(all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"), test))]
+#[cfg(any(
+    all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"),
+    test
+))]
 fn parse_rss_anon_kb(status: &str) -> Option<u64> {
     status
         .lines()
@@ -626,8 +648,20 @@ mod tests {
 
     #[test]
     fn parses_rss_anon_from_proc_status() {
-        let body = "Name:\tuss-se\nVmRSS:\t  998456 kB\nRssAnon:\t  951000 kB\nRssFile:\t   47456 kB\n";
+        let body =
+            "Name:\tuss-se\nVmRSS:\t  998456 kB\nRssAnon:\t  951000 kB\nRssFile:\t   47456 kB\n";
         assert_eq!(parse_rss_anon_kb(body), Some(951_000));
         assert_eq!(parse_rss_anon_kb("VmRSS:\t 10 kB\n"), None);
+    }
+
+    #[test]
+    fn mount_matching_uses_path_components() {
+        assert!(path_on_mount(Path::new("/srv/app"), Path::new("/")));
+        assert!(path_on_mount(Path::new("/srv/app"), Path::new("/srv")));
+        assert!(!path_on_mount(
+            Path::new("/srv/application"),
+            Path::new("/srv/app")
+        ));
+        assert!(path_on_mount(Path::new("/srv/app"), Path::new("")));
     }
 }

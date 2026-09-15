@@ -161,10 +161,9 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
 
     kind.eq_ignore_ascii_case("application")
         && (subtype.eq_ignore_ascii_case("json")
-            || subtype
-                .to_ascii_lowercase()
-                .strip_suffix("+json")
-                .is_some_and(|prefix| !prefix.is_empty()))
+            || subtype.rsplit_once('+').is_some_and(|(prefix, suffix)| {
+                !prefix.is_empty() && suffix.eq_ignore_ascii_case("json")
+            }))
 }
 
 #[cfg(test)]

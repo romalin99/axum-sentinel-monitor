@@ -1,6 +1,6 @@
 [package]
 name = "axum-sentinel-monitor"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.98.1"
 description = "A Fiber Monitor-style runtime dashboard for Axum"

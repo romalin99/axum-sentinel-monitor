@@ -11,7 +11,7 @@ documentation = "https://docs.rs/axum-sentinel-monitor"
 readme = "README.md"
 keywords = ["axum", "monitoring", "middleware", "metrics", "sentinel"]
 categories = ["web-programming", "development-tools::profiling"]
-exclude = ["/.github", "/benches", "/examples/data"]
+exclude = ["/.github", "/benches", "/examples/data", "/tcg-uss-se-dev.*"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "query", "tokio"] }

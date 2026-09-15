@@ -11,6 +11,16 @@ no remote analytics service, Prometheus scrape, or other third-party backend is
 required. It does not persist metrics beyond the 60-second HTTP ring, run a
 background collection loop, or replace Prometheus, OpenTelemetry, or an APM.
 
+## Screenshots
+
+### Runtime
+
+![Runtime monitoring dashboard](docs/images/tcg-uss-se-1.png)
+
+### API
+
+![API monitoring dashboard](docs/images/tcg-uss-se-2.png)
+
 ## Features
 
 - Process CPU, RSS, threads, file descriptors/handles, and uptime
@@ -20,7 +30,7 @@ background collection loop, or replace Prometheus, OpenTelemetry, or an APM.
 - Per-route Endpoints list with in-flight, 30s/60s QPS, and P50 / P99 / P999
 - HTTP samples live in a 60-second ring (one slot per second); data older than 60s is discarded
 - Seven trend charts plus Heap, disk, and status-code detail views
-- Light/Dark toggle and a 30s/60s HTTP window, persisted in local storage
+- Light/Dark toggle and a global 30s/60s chart window, persisted in local storage
 - HTML dashboard or API-only operation
 - SIMD-accelerated JSON extraction and serialization through `sonic-rs`
 
@@ -101,7 +111,7 @@ requests are not included in HTTP metrics.
 | System | CPU, used/available/total memory, application-filesystem usage/type/free space, 1/5/15-minute load averages, aggregate network rates |
 | HTTP | Lifetime request/status totals, in-flight, 30s/60s QPS, 4xx/5xx rates, P50/P95/P99/P999, a 60-point 1s series, and per-route windows |
 
-HTTP QPS and latency are computed inside the process from a 60-second ring. There is no Prometheus, SaaS analytics, or other remote backend. Slots older than `HTTP_WINDOW` (60 seconds) are overwritten. The dashboard has a **Runtime** tab (process/system) and an **API** tab (QPS, latency percentiles, error rate, status codes, and an Endpoints list). Each route is shown like a volume list: count, method, path, and a status-colored bar. In-flight calls use the same row. 30s/60s QPS, P50, P99, and P999 sit on the right. Numeric, UUID, and `{param}` path segments are collapsed to `:id`. At most 64 routes are retained. The API tab 30s/60s toggle shows the most recent 30 or 60 seconds of that ring. It does not keep more than 60 seconds, and it does not collect location, device, usage-time, or day-of-week dimensions.
+HTTP QPS and latency are computed inside the process from a 60-second ring. There is no Prometheus, SaaS analytics, or other remote backend. Slots older than `HTTP_WINDOW` (60 seconds) are overwritten. The dashboard has a **Runtime** tab (process/system) and an **API** tab (QPS, latency percentiles, error rate, status codes, and an Endpoints list). Each route is shown like a volume list: count, method, path, and a status-colored bar. In-flight calls use the same row. 30s/60s QPS, P50, P99, and P999 sit on the right. Numeric, UUID, and `{param}` path segments are collapsed to `:id`. At most 64 routes are retained. The global header toggle shows the most recent 30 or 60 seconds across Runtime trends and API metrics. It does not keep more than 60 seconds of HTTP data, and it does not collect location, device, usage-time, or day-of-week dimensions.
 
 Unsupported, failed, and not-yet-available process/system window metrics are encoded as `null`,
 not as a synthetic zero. CPU and network rates need two collection windows; their first snapshot is `null`. HTTP QPS is `0` until the first completed request, and latency percentiles are `null` while the selected window has no samples.

@@ -71,6 +71,10 @@ mod tests {
         assert!(html.contains(">P999<"));
         assert!(html.contains(">30s<"));
         assert!(html.contains(">60s<"));
+        assert!(
+            html.find("aria-label=\"Global metrics window\"").unwrap()
+                < html.find("id=\"page-api\"").unwrap()
+        );
         assert!(!html.contains("data-samples=\"90\""));
         assert!(!html.contains("Location"));
         assert!(!html.contains("Day of week"));

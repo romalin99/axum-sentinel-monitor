@@ -1091,6 +1091,10 @@
       <div class="header-side">
         <div class="status-box" aria-live="polite">
           <span class="status-controls" aria-label="Display preferences">
+            <span class="sample-toggle" role="group" aria-label="Global metrics window">
+              <button type="button" class="sample-option" data-samples="30" aria-pressed="false">30s</button>
+              <button type="button" class="sample-option" data-samples="60" aria-pressed="true">60s</button>
+            </span>
             <button type="button" id="theme-toggle" class="control-dot" data-active="dark" title="Theme"><span class="visually-hidden">Toggle theme</span></button>
           </span>
           <div class="status-line"><span class="status-state"><span id="live-dot" data-status="error"></span><span id="live-text">ERROR</span></span></div>
@@ -1157,10 +1161,6 @@
       <div class="chart-section">
         <div class="section-title">
           <h2>API</h2>
-          <div class="sample-toggle" role="group" aria-label="QPS window">
-            <button type="button" class="sample-option" data-samples="30" aria-pressed="false">30s</button>
-            <button type="button" class="sample-option" data-samples="60" aria-pressed="true">60s</button>
-          </div>
         </div>
         <p class="api-note" id="api-window-note">Last 60 seconds. Samples older than 60s are discarded.</p>
         <div class="kpi-grid">
@@ -1236,6 +1236,7 @@
     const HIDDEN_REFRESH_MS = Math.max(REFRESH_MS, 30000);
     const dash = "\u2014";
     const history = {
+      timestamps: [],
       labels: [],
       processCPU: [],
       systemCPU: [],
@@ -1541,7 +1542,12 @@
     }
 
     function visibleSamples(values) {
-      return values.slice(Math.max(0, values.length - currentSampleWindow));
+      const timestamps = history.timestamps;
+      if (!timestamps.length) return [];
+      const cutoff = timestamps[timestamps.length - 1] - currentSampleWindow * 1000;
+      let start = 0;
+      while (start < timestamps.length && timestamps[start] < cutoff) start += 1;
+      return values.slice(start);
     }
 
     function fillZero(values) {
@@ -1804,7 +1810,9 @@
       const process = snapshot.process || {};
       const runtime = snapshot.runtime || {};
       const system = snapshot.system || {};
-      history.labels.push(new Date(snapshot.collected_at).toLocaleTimeString());
+      const collectedAt = new Date(snapshot.collected_at);
+      history.timestamps.push(collectedAt.getTime());
+      history.labels.push(collectedAt.toLocaleTimeString());
       history.processCPU.push(finite(process.cpu_percent) ? process.cpu_percent : null);
       history.systemCPU.push(finite(system.cpu_percent) ? system.cpu_percent : null);
       history.rss.push(finite(process.rss_bytes) ? process.rss_bytes : null);

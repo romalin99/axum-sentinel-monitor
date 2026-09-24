@@ -306,13 +306,7 @@ impl SlidingWindow {
 
         TrafficSnapshot {
             window_30: finish_agg(WINDOW_30_SECS, tick, requests_30, status_30, &hist_30),
-            window_60: finish_agg(
-                WINDOW_60_SECS,
-                tick,
-                requests_60,
-                status_60,
-                &hist_60,
-            ),
+            window_60: finish_agg(WINDOW_60_SECS, tick, requests_60, status_60, &hist_60),
             window_90: finish_agg(WINDOW_SECS, tick, requests_90, status_90, &hist_90),
             series,
         }

@@ -3,10 +3,10 @@
 //! [`Monitor::router`] serves an HTML dashboard (or JSON when requested), while
 //! [`Monitor::layer`] records HTTP metrics for application traffic. Requests to
 //! the monitor endpoint itself are not counted. HTTP QPS and latency percentiles
-//! are computed in-process from a 60-second ring; samples older than
+//! are computed in-process from a 90-second ring; samples older than
 //! [`HTTP_WINDOW`] are discarded. The dashboard API tab also lists per-route
-//! in-flight calls plus 30s/60s QPS and P50/P95/P99/P999. At most 64 routes are
-//! tracked: once the table is full, routes with no request in the trailing 60s
+//! in-flight calls plus 30s/60s/90s QPS and P50/P95/P99/P999. At most 64 routes are
+//! tracked: once the table is full, routes with no request in the trailing 90s
 //! window are evicted first and the least recently used row goes first within
 //! that group, while rows with in-flight requests are never evicted.
 
@@ -310,7 +310,7 @@ mod tests {
         assert!(html.contains("P999"));
         assert!(html.contains("data-page=\"api\""));
         assert!(html.contains("Endpoints"));
-        assert!(!html.contains("data-samples=\"90\""));
+        assert!(html.contains("data-samples=\"90\""));
     }
 
     #[tokio::test]
@@ -342,18 +342,23 @@ mod tests {
         let value: sonic_rs::Value = sonic_rs::from_slice(&body).unwrap();
         assert_eq!(value["http"]["requests"], 1);
         assert_eq!(value["http"]["status"]["2xx"], 1);
-        assert_eq!(value["http"]["window_seconds"], 60);
+        assert_eq!(value["http"]["window_seconds"], 90);
         assert_eq!(
             value["http"]["series"].as_array().map(|rows| rows.len()),
-            Some(60)
+            Some(90)
         );
         assert_eq!(value["http"]["windows"]["60"]["requests"], 1);
         assert_eq!(value["http"]["windows"]["60"]["status"]["2xx"], 1);
+        assert_eq!(value["http"]["windows"]["90"]["requests"], 1);
         assert_eq!(value["http"]["endpoints"][0]["path"], "/");
         assert_eq!(value["http"]["endpoints"][0]["method"], "GET");
         assert_eq!(value["http"]["endpoints"][0]["in_flight"], 0);
         assert_eq!(
             value["http"]["endpoints"][0]["windows"]["60"]["requests"],
+            1
+        );
+        assert_eq!(
+            value["http"]["endpoints"][0]["windows"]["90"]["requests"],
             1
         );
         assert!(value["http"]["latency"]["p50_ns"].is_u64());

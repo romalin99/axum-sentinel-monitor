@@ -4,7 +4,7 @@ use std::time::Duration;
 pub const MIN_REFRESH: Duration = Duration::from_secs(1);
 
 /// In-process HTTP samples older than this are discarded.
-pub const HTTP_WINDOW: Duration = Duration::from_secs(60);
+pub const HTTP_WINDOW: Duration = Duration::from_secs(90);
 
 const DEFAULT_TITLE: &str = "Axum Sentinel Monitor";
 const DEFAULT_DESCRIPTION: &str =
@@ -62,7 +62,7 @@ impl Config {
     pub const MIN_REFRESH: Duration = Duration::from_secs(1);
 
     /// In-process HTTP samples older than this are discarded.
-    pub const HTTP_WINDOW: Duration = Duration::from_secs(60);
+    pub const HTTP_WINDOW: Duration = Duration::from_secs(90);
 
     pub(crate) fn normalized(mut self) -> Self {
         if self.title.is_empty() {

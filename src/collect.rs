@@ -231,6 +231,7 @@ impl Collector {
         let traffic = http.latency().snapshot();
         let window_30 = to_window_stats(&traffic.window_30);
         let window_60 = to_window_stats(&traffic.window_60);
+        let window_90 = to_window_stats(&traffic.window_90);
         HttpStats {
             requests: http.requests(),
             in_flight: http.in_flight(),
@@ -242,6 +243,7 @@ impl Collector {
             windows: HttpWindows {
                 secs_30: window_30,
                 secs_60: window_60,
+                secs_90: window_90,
             },
             series: traffic
                 .series
@@ -267,6 +269,7 @@ impl Collector {
                     windows: HttpWindows {
                         secs_30: to_window_stats(&endpoint.window_30),
                         secs_60: to_window_stats(&endpoint.window_60),
+                        secs_90: to_window_stats(&endpoint.window_90),
                     },
                 })
                 .collect(),

@@ -69,13 +69,13 @@ mod tests {
         assert!(html.contains(">P95<"));
         assert!(html.contains(">P99<"));
         assert!(html.contains(">P999<"));
-        assert!(html.contains(">30s<"));
-        assert!(html.contains(">60s<"));
+        assert!(html.contains(">30<"));
+        assert!(html.contains(">60<"));
+        assert!(html.contains(">90<"));
         assert!(
             html.find("aria-label=\"Global metrics window\"").unwrap()
                 < html.find("id=\"page-api\"").unwrap()
         );
-        assert!(!html.contains("data-samples=\"90\""));
         assert!(!html.contains("Location"));
         assert!(!html.contains("Day of week"));
         assert!(html.contains("data-theme=\"dark\""));

@@ -83,11 +83,11 @@ pub struct HttpStats {
     pub windows: HttpWindows,
     /// One point per second for the retained window, oldest first.
     pub series: Vec<HttpSecondSample>,
-    /// Per-route 30s/60s stats, in-flight first then busiest. Samples older than 60s are dropped.
+    /// Per-route 30s/60s/90s stats, in-flight first then busiest. Samples older than 90s are dropped.
     pub endpoints: Vec<HttpEndpointStats>,
 }
 
-/// Method + path traffic for the same 30s/60s ring as [`HttpStats`].
+/// Method + path traffic for the same 30s/60s/90s ring as [`HttpStats`].
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct HttpEndpointStats {
     pub method: String,
@@ -97,16 +97,18 @@ pub struct HttpEndpointStats {
     pub windows: HttpWindows,
 }
 
-/// 30-second and 60-second views of the same in-process ring.
+/// 30-second, 60-second, and 90-second views of the same in-process ring.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct HttpWindows {
     #[serde(rename = "30")]
     pub secs_30: HttpWindowStats,
     #[serde(rename = "60")]
     pub secs_60: HttpWindowStats,
+    #[serde(rename = "90")]
+    pub secs_90: HttpWindowStats,
 }
 
-/// Aggregated HTTP traffic for a sliding window that never exceeds 60 seconds.
+/// Aggregated HTTP traffic for a sliding window that never exceeds 90 seconds.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct HttpWindowStats {
     pub seconds: u32,

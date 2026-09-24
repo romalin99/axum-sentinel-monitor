@@ -49,8 +49,9 @@ async fn serves_default_and_custom_dashboard_safely() {
     assert!(html.contains("endpoint-stats"));
     assert!(html.contains(">P50<"));
     assert!(html.contains(">P999<"));
-    assert!(html.contains(">30s<"));
-    assert!(!html.contains("data-samples=\"90\""));
+    assert!(html.contains(">30<"));
+    assert!(html.contains(">60<"));
+    assert!(html.contains(">90<"));
     assert!(!html.contains("Location"));
     assert!(!html.contains("Day of week"));
     assert!(!html.contains("__MONITOR_TITLE__"));
@@ -103,13 +104,14 @@ async fn serves_documented_json_schema_with_accept_negotiation() {
     assert_eq!(value["http"]["requests"], 0);
     assert!(value["http"]["in_flight"].is_u64());
     assert!(value["http"]["status"]["2xx"].is_u64());
-    assert_eq!(value["http"]["window_seconds"], 60);
+    assert_eq!(value["http"]["window_seconds"], 90);
     assert_eq!(
         value["http"]["series"].as_array().map(|rows| rows.len()),
-        Some(60)
+        Some(90)
     );
     assert_eq!(value["http"]["windows"]["30"]["seconds"], 30);
     assert_eq!(value["http"]["windows"]["60"]["seconds"], 60);
+    assert_eq!(value["http"]["windows"]["90"]["seconds"], 90);
     assert!(value["http"]["windows"]["60"]["status"].is_object());
     assert!(value["http"]["endpoints"].is_array());
     assert!(value["http"]["latency"].is_object());

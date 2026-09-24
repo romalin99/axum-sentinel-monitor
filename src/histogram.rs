@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-pub(crate) const WINDOW_SECS: u64 = 60;
+pub(crate) const WINDOW_SECS: u64 = 90;
 pub(crate) const WINDOW_30_SECS: u64 = 30;
+pub(crate) const WINDOW_60_SECS: u64 = 60;
 
 const SUB_BITS: u32 = 3;
 const SUB: u64 = 1 << SUB_BITS;
@@ -169,6 +170,7 @@ pub(crate) struct SecondSample {
 pub(crate) struct TrafficSnapshot {
     pub window_30: WindowAgg,
     pub window_60: WindowAgg,
+    pub window_90: WindowAgg,
     pub series: Vec<SecondSample>,
 }
 
@@ -220,21 +222,22 @@ impl SlidingWindow {
         self.fold(true, self.current_tick())
     }
 
-    /// 30s/60s aggregates without the 60-point series or per-second percentiles.
+    /// 30s/60s/90s aggregates without the 90-point series or per-second percentiles.
     #[cfg(test)]
-    pub(crate) fn snapshot_windows(&self) -> (WindowAgg, WindowAgg) {
+    pub(crate) fn snapshot_windows(&self) -> (WindowAgg, WindowAgg, WindowAgg) {
         self.snapshot_windows_at(self.current_tick())
     }
 
-    pub(crate) fn snapshot_windows_at(&self, tick: u64) -> (WindowAgg, WindowAgg) {
+    pub(crate) fn snapshot_windows_at(&self, tick: u64) -> (WindowAgg, WindowAgg, WindowAgg) {
         let folded = self.fold(false, tick);
-        (folded.window_30, folded.window_60)
+        (folded.window_30, folded.window_60, folded.window_90)
     }
 
-    pub(crate) fn empty_windows(tick: u64) -> (WindowAgg, WindowAgg) {
+    pub(crate) fn empty_windows(tick: u64) -> (WindowAgg, WindowAgg, WindowAgg) {
         let hist = LatencyHist::default();
         (
             finish_agg(WINDOW_30_SECS, tick, 0, [0; 5], &hist),
+            finish_agg(WINDOW_60_SECS, tick, 0, [0; 5], &hist),
             finish_agg(WINDOW_SECS, tick, 0, [0; 5], &hist),
         )
     }
@@ -243,11 +246,14 @@ impl SlidingWindow {
         let unix = if with_series { unix_now() } else { 0 };
         let mut hist_30 = LatencyHist::default();
         let mut hist_60 = LatencyHist::default();
+        let mut hist_90 = LatencyHist::default();
         let mut slot_hist = LatencyHist::default();
         let mut status_30 = [0u64; 5];
         let mut status_60 = [0u64; 5];
+        let mut status_90 = [0u64; 5];
         let mut requests_30 = 0u64;
         let mut requests_60 = 0u64;
+        let mut requests_90 = 0u64;
         let mut series = Vec::with_capacity(if with_series { WINDOW_SECS as usize } else { 0 });
 
         for age in (0..WINDOW_SECS).rev() {
@@ -283,9 +289,14 @@ impl SlidingWindow {
             if requests == 0 {
                 continue;
             }
-            requests_60 += requests;
-            add_status(&mut status_60, status);
-            hist_60.add_from(&slot_hist);
+            requests_90 += requests;
+            add_status(&mut status_90, status);
+            hist_90.add_from(&slot_hist);
+            if age < WINDOW_60_SECS {
+                requests_60 += requests;
+                add_status(&mut status_60, status);
+                hist_60.add_from(&slot_hist);
+            }
             if age < WINDOW_30_SECS {
                 requests_30 += requests;
                 add_status(&mut status_30, status);
@@ -295,7 +306,14 @@ impl SlidingWindow {
 
         TrafficSnapshot {
             window_30: finish_agg(WINDOW_30_SECS, tick, requests_30, status_30, &hist_30),
-            window_60: finish_agg(WINDOW_SECS, tick, requests_60, status_60, &hist_60),
+            window_60: finish_agg(
+                WINDOW_60_SECS,
+                tick,
+                requests_60,
+                status_60,
+                &hist_60,
+            ),
+            window_90: finish_agg(WINDOW_SECS, tick, requests_90, status_90, &hist_90),
             series,
         }
     }
@@ -453,9 +471,10 @@ mod tests {
         assert!(snap.window_60.p50_ns.unwrap() <= Duration::from_millis(5).as_nanos() as u64);
         assert!(snap.window_60.p99_ns.unwrap() >= Duration::from_millis(40).as_nanos() as u64);
 
-        window.advance_secs(61);
+        window.advance_secs(91);
         let expired = window.snapshot();
         assert_eq!(expired.window_60.requests, 0);
+        assert_eq!(expired.window_90.requests, 0);
         assert!(expired.window_60.p50_ns.is_none());
         assert!(expired.series.iter().all(|sample| sample.requests == 0));
 
@@ -474,18 +493,19 @@ mod tests {
     }
 
     #[test]
-    fn p999_tracks_tail_and_series_is_sixty_seconds() {
+    fn p999_tracks_tail_and_series_is_ninety_seconds() {
         let window = SlidingWindow::new();
         for _ in 0..998 {
             window.observe(Duration::from_millis(2).as_nanos() as u64, 2);
         }
         window.observe(Duration::from_millis(80).as_nanos() as u64, 2);
         let snap = window.snapshot();
-        assert_eq!(snap.series.len(), 60);
+        assert_eq!(snap.series.len(), 90);
         assert!(snap.window_60.p50_ns.unwrap() < Duration::from_millis(10).as_nanos() as u64);
         assert!(snap.window_60.p999_ns.unwrap() >= Duration::from_millis(80).as_nanos() as u64);
         assert!((snap.window_60.rps - 999.0).abs() < f64::EPSILON);
         assert_eq!(snap.window_30.requests, snap.window_60.requests);
+        assert_eq!(snap.window_60.requests, snap.window_90.requests);
     }
 
     #[test]
@@ -503,19 +523,35 @@ mod tests {
     }
 
     #[test]
+    fn ninety_second_view_keeps_slots_dropped_from_sixty_seconds() {
+        let window = SlidingWindow::new();
+        window.observe(1_000_000, 2);
+        window.advance_secs(61);
+        window.observe(2_000_000, 4);
+        let snap = window.snapshot();
+        assert_eq!(snap.window_30.requests, 1);
+        assert_eq!(snap.window_60.requests, 1);
+        assert_eq!(snap.window_90.requests, 2);
+        assert_eq!(snap.window_90.status[1], 1);
+        assert_eq!(snap.window_90.status[3], 1);
+    }
+
+    #[test]
     fn windows_match_full_snapshot_without_building_series() {
         let window = SlidingWindow::new();
         window.observe(1_000_000, 2);
         window.advance_secs(31);
         window.observe(2_000_000, 4);
         let snap = window.snapshot();
-        let (window_30, window_60) = window.snapshot_windows();
+        let (window_30, window_60, window_90) = window.snapshot_windows();
         assert_eq!(window_30.requests, snap.window_30.requests);
         assert_eq!(window_30.status, snap.window_30.status);
         assert_eq!(window_30.p50_ns, snap.window_30.p50_ns);
         assert_eq!(window_60.requests, snap.window_60.requests);
         assert_eq!(window_60.status, snap.window_60.status);
         assert_eq!(window_60.p999_ns, snap.window_60.p999_ns);
+        assert_eq!(window_90.requests, snap.window_90.requests);
+        assert_eq!(window_90.status, snap.window_90.status);
         assert!(window.snapshot_windows().0.seconds == 30);
     }
 
@@ -540,6 +576,7 @@ mod tests {
         let snapshot = window.snapshot();
         assert_eq!(snapshot.window_60.requests, (THREADS * SAMPLES) as u64);
         assert_eq!(snapshot.window_60.status[1], (THREADS * SAMPLES) as u64);
+        assert_eq!(snapshot.window_90.requests, (THREADS * SAMPLES) as u64);
     }
 
     #[test]

@@ -1092,8 +1092,9 @@
         <div class="status-box" aria-live="polite">
           <span class="status-controls" aria-label="Display preferences">
             <span class="sample-toggle" role="group" aria-label="Global metrics window">
-              <button type="button" class="sample-option" data-samples="30" aria-pressed="false">30s</button>
-              <button type="button" class="sample-option" data-samples="60" aria-pressed="true">60s</button>
+              <button type="button" class="sample-option" data-samples="30" aria-pressed="false">30</button>
+              <button type="button" class="sample-option" data-samples="60" aria-pressed="true">60</button>
+              <button type="button" class="sample-option" data-samples="90" aria-pressed="false">90</button>
             </span>
             <button type="button" id="theme-toggle" class="control-dot" data-active="dark" title="Theme"><span class="visually-hidden">Toggle theme</span></button>
           </span>
@@ -1162,7 +1163,7 @@
         <div class="section-title">
           <h2>API</h2>
         </div>
-        <p class="api-note" id="api-window-note">Last 60 seconds. Samples older than 60s are discarded.</p>
+        <p class="api-note" id="api-window-note">Last 60 seconds. Samples older than 90s are discarded.</p>
         <div class="kpi-grid">
           <article class="kpi-card"><span class="kpi-label">QPS</span><strong id="kpi-qps">-</strong><em id="kpi-in-flight">In-flight -</em></article>
           <article class="kpi-card"><span class="kpi-label">Requests</span><strong id="kpi-requests">-</strong><em id="kpi-lifetime">Lifetime -</em></article>
@@ -1230,8 +1231,8 @@
 (() => {
     "use strict";
     const REFRESH_MS = __MONITOR_REFRESH_MS__;
-    const MAX_SAMPLES = 60;
-    const SAMPLE_WINDOWS = [30, 60];
+    const MAX_SAMPLES = 90;
+    const SAMPLE_WINDOWS = [30, 60, 90];
     const QPS_SMOOTH_SECS = 5;
     const HIDDEN_REFRESH_MS = Math.max(REFRESH_MS, 30000);
     const dash = "\u2014";
@@ -1397,7 +1398,7 @@
 
     function endpointWindow(endpoint) {
       const windows = endpoint && endpoint.windows ? endpoint.windows : {};
-      return windows[String(currentSampleWindow)] || windows["60"] || {};
+      return windows[String(currentSampleWindow)] || windows["90"] || windows["60"] || {};
     }
 
     function endpointFilterCount(endpoint, filter) {
@@ -1742,7 +1743,7 @@
         !finite(currentSystem.load15) && !collectionErrors.includes("system.load");
       const covered = finite(selected.covered_seconds) ? selected.covered_seconds : currentSampleWindow;
       setText("api-window-note", "Last " + currentSampleWindow + "s window (" + covered +
-        "s covered). Samples older than 60s are discarded.");
+        "s covered). Samples older than 90s are discarded.");
 
       setText("pid-cpu", percent(process.cpu_percent));
       setText("pid-rss", optional(process.rss_bytes, formatBytes));

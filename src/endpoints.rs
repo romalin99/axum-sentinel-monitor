@@ -7,7 +7,7 @@ use std::time::Instant;
 use crate::histogram::{SlidingWindow, WINDOW_SECS, WindowAgg};
 
 /// Upper bound on tracked routes. When the table is full a row is evicted in
-/// this order of preference: rows with no requests in the trailing 60s window
+/// this order of preference: rows with no requests in the trailing 90s window
 /// first, then the rest, least recently used first within each group. Rows with
 /// in-flight requests are never evicted, so a long-running request keeps its row
 /// until it completes.
@@ -34,7 +34,7 @@ struct RouteMetrics {
     in_flight: AtomicU64,
     last_used: AtomicU64,
     /// Tick of the most recent request, biased by one so `0` means "never". Lets
-    /// eviction test the 60s window with a single load instead of walking all
+    /// eviction test the 90s window with a single load instead of walking all
     /// [`WINDOW_SECS`] slots of the route's histogram.
     last_observe: AtomicU64,
 }
@@ -78,6 +78,7 @@ pub(crate) struct EndpointTraffic {
     pub in_flight: u64,
     pub window_30: WindowAgg,
     pub window_60: WindowAgg,
+    pub window_90: WindowAgg,
 }
 
 impl EndpointSet {
@@ -132,7 +133,7 @@ impl EndpointSet {
         let mut rows: Vec<EndpointTraffic> = routes
             .into_iter()
             .map(|(method, path, metrics)| {
-                let (window_30, window_60) = if metrics.is_cold(tick) {
+                let (window_30, window_60, window_90) = if metrics.is_cold(tick) {
                     SlidingWindow::empty_windows(tick)
                 } else {
                     metrics.window.snapshot_windows_at(tick)
@@ -143,6 +144,7 @@ impl EndpointSet {
                     in_flight: metrics.in_flight.load(Ordering::Relaxed),
                     window_30,
                     window_60,
+                    window_90,
                 }
             })
             .collect();
@@ -150,7 +152,7 @@ impl EndpointSet {
             right
                 .in_flight
                 .cmp(&left.in_flight)
-                .then_with(|| right.window_60.requests.cmp(&left.window_60.requests))
+                .then_with(|| right.window_90.requests.cmp(&left.window_90.requests))
                 .then_with(|| left.method.cmp(&right.method))
                 .then_with(|| left.path.cmp(&right.path))
         });
@@ -210,7 +212,7 @@ impl EndpointSet {
 }
 
 /// Drops one idle row, preferring routes that saw no request in the trailing
-/// 60s window and breaking ties by least recently used. Returns `false` when
+/// 90s window and breaking ties by least recently used. Returns `false` when
 /// every row is in flight — the caller then falls back to the shared overflow
 /// row so the table stays bounded either way.
 fn evict_one(routes: &mut HashMap<RouteKey, Arc<RouteMetrics>>, tick: u64) -> bool {
@@ -373,6 +375,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.path == "/slow"));
         assert!(rows[0].window_60.p50_ns.is_some());
         assert!(rows[0].window_30.rps > 0.0);
+        assert_eq!(rows[0].window_90.requests, 2);
     }
 
     #[test]
@@ -412,9 +415,10 @@ mod tests {
             Duration::from_millis(4).as_nanos() as u64,
             2,
         );
-        extra.fetch_add(61, Ordering::Relaxed);
+        extra.fetch_add(91, Ordering::Relaxed);
         let expired = set.snapshot();
         assert_eq!(expired[0].window_60.requests, 0);
+        assert_eq!(expired[0].window_90.requests, 0);
         assert!(expired[0].window_60.p50_ns.is_none());
         assert_eq!(expired[0].window_30.requests, 0);
         assert_eq!(expired[0].in_flight, 0);
@@ -499,7 +503,7 @@ mod tests {
         let extra = Arc::new(AtomicU64::new(0));
         let set = EndpointSet::with_clock(Instant::now(), Arc::clone(&extra));
         set.observe_path("GET", "/stale", 1_000_000, 2);
-        extra.fetch_add(61, Ordering::Relaxed);
+        extra.fetch_add(91, Ordering::Relaxed);
         for index in 0..(MAX_ENDPOINTS - 1) {
             set.observe_path("GET", &format!("/route-{index}"), 1_000_000, 2);
         }

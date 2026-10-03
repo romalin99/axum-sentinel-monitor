@@ -94,7 +94,7 @@ impl Monitor {
     /// Snapshots are collected on demand and cached for [`Config::refresh`].
     pub fn new(config: Config) -> Self {
         let config = Arc::new(config.normalized());
-        let stats = stats::SharedStats::new(config.refresh);
+        let stats = stats::SharedStats::new(config.refresh, &config.route);
         let dashboard = if config.api_only {
             Bytes::new()
         } else {
@@ -129,7 +129,6 @@ impl Monitor {
     pub fn layer(&self) -> MonitorLayer {
         MonitorLayer {
             stats: Arc::clone(&self.stats),
-            skip_path: Arc::from(self.config.route.as_str()),
         }
     }
 
@@ -159,8 +158,10 @@ impl Monitor {
     ///
     /// Cold collection and serialization run on the blocking pool. Cache hits
     /// return shared encoded bytes without scheduling another blocking task.
+    /// The cache probe never blocks: while another poll is collecting, this one
+    /// waits for the result on the blocking pool rather than on its worker.
     async fn collect_json(&self) -> Result<Bytes, String> {
-        if let Some(snapshot) = self.stats.cached_snapshot() {
+        if let Some(snapshot) = self.stats.try_cached_snapshot() {
             return encode_snapshot(&self.encoded, snapshot);
         }
         let stats = Arc::clone(&self.stats);
@@ -228,19 +229,28 @@ impl Monitor {
 
 /// Serializes `snapshot`, reusing the cached bytes when it is the snapshot that
 /// was encoded last.
+///
+/// The lock is held only to read or replace the cache entry, never while
+/// serializing, so a cache hit on an async worker is not stalled behind a
+/// serialization on the blocking pool. Two polls that miss at the same time
+/// both serialize the same snapshot and store the same bytes, which is correct
+/// and rare.
 fn encode_snapshot(
     cache: &Mutex<Option<EncodedSnapshot>>,
     snapshot: Arc<Snapshot>,
 ) -> Result<Bytes, String> {
-    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(encoded) = cache.as_ref()
-        && Arc::ptr_eq(&encoded.source, &snapshot)
     {
-        return Ok(encoded.body.clone());
+        let cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(encoded) = cache.as_ref()
+            && Arc::ptr_eq(&encoded.source, &snapshot)
+        {
+            return Ok(encoded.body.clone());
+        }
     }
     let body = sonic_rs::to_vec(&*snapshot)
         .map(Bytes::from)
         .map_err(|error| error.to_string())?;
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
     *cache = Some(EncodedSnapshot {
         source: snapshot,
         body: body.clone(),

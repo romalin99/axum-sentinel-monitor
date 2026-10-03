@@ -48,25 +48,15 @@ impl Default for LatencyHist {
 }
 
 impl LatencyHist {
-    /// Adds `count` samples to bucket `index`.
-    fn add_bucket(&mut self, index: usize, count: u64) {
-        if count == 0 || index >= BUCKETS {
-            return;
-        }
-        self.buckets[index] += count;
-        self.count += count;
-    }
-
     /// Merges every bucket of `other` into this histogram.
     fn add_from(&mut self, other: &Self) {
         if other.count == 0 {
             return;
         }
         self.count += other.count;
+        // A branch-free loop over the fixed-size arrays vectorizes.
         for (dst, src) in self.buckets.iter_mut().zip(&other.buckets) {
-            if *src != 0 {
-                *dst += *src;
-            }
+            *dst += *src;
         }
     }
 
@@ -158,9 +148,14 @@ impl Slot {
         }
         let status =
             std::array::from_fn(|index| u64::from(self.status[index].load(Ordering::Relaxed)));
-        for (index, bucket) in self.buckets.iter().enumerate() {
-            hist.add_bucket(index, u64::from(bucket.load(Ordering::Relaxed)));
+        // `hist` was reset above, so the buckets are assigned rather than added.
+        let mut total = 0;
+        for (dst, bucket) in hist.buckets.iter_mut().zip(&self.buckets) {
+            let count = u64::from(bucket.load(Ordering::Relaxed));
+            *dst = count;
+            total += count;
         }
+        hist.count = total;
         if self.tick.load(Ordering::Acquire) != expected_tick {
             hist.reset();
             return None;
@@ -265,17 +260,16 @@ impl SlidingWindow {
     /// Records one request of `ns` nanoseconds at the current tick.
     #[cfg(test)]
     pub(crate) fn observe(&self, ns: u64, status_class: u8) {
-        self.observe_at(self.current_tick(), ns, status_class);
+        let (bucket, class) = sample_of(ns, status_class);
+        self.record(self.current_tick(), bucket, class);
     }
 
-    /// Records one request of `ns` nanoseconds in the slot of `tick`.
+    /// Records one request in the slot of `tick`.
     ///
-    /// The sample is dropped when the slot has already moved on to a newer second.
-    pub(crate) fn observe_at(&self, tick: u64, ns: u64, status_class: u8) {
-        let index = bucket_of(ns);
-        let status = (1..=5)
-            .contains(&status_class)
-            .then_some((status_class - 1) as usize);
+    /// `bucket` and `class` come from [`sample_of`], computed once by the caller
+    /// and shared by the global and the per-route window. The sample is dropped
+    /// when the slot has already moved on to a newer second.
+    pub(crate) fn record(&self, tick: u64, bucket: usize, class: Option<usize>) {
         let Some(slot) = self.slot_for(tick) else {
             return;
         };
@@ -283,10 +277,10 @@ impl SlidingWindow {
             return;
         }
         slot.requests.fetch_add(1, Ordering::Relaxed);
-        if let Some(class) = status {
+        if let Some(class) = class {
             slot.status[class].fetch_add(1, Ordering::Relaxed);
         }
-        slot.buckets[index].fetch_add(1, Ordering::Relaxed);
+        slot.buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns the window aggregates and the per-second series as of now.
@@ -317,75 +311,36 @@ impl SlidingWindow {
         )
     }
 
-    /// Walks the ring once, oldest second first, accumulating all three windows
+    /// Walks the ring once, newest second first, accumulating all three windows
     /// and, when `with_series` is set, the per-second series.
+    ///
+    /// The windows nest, so one running total serves all three: it is the 30s
+    /// window after 30 seconds, the 60s window after 60, and the 90s window at
+    /// the end. Each slot is therefore merged once instead of up to three times.
     fn fold(&self, with_series: bool, tick: u64) -> TrafficSnapshot {
-        let unix = if with_series { unix_now() } else { 0 };
-        let mut hist_30 = LatencyHist::default();
-        let mut hist_60 = LatencyHist::default();
-        let mut hist_90 = LatencyHist::default();
-        let mut slot_hist = LatencyHist::default();
-        let mut status_30 = [0u64; 5];
-        let mut status_60 = [0u64; 5];
-        let mut status_90 = [0u64; 5];
-        let mut requests_30 = 0u64;
-        let mut requests_60 = 0u64;
-        let mut requests_90 = 0u64;
-        let mut series = Vec::with_capacity(if with_series { WINDOW_SECS as usize } else { 0 });
-
-        for age in (0..WINDOW_SECS).rev() {
-            let loaded = if tick < age {
-                None
-            } else {
-                let slot_tick = tick - age;
-                self.slots[(slot_tick % WINDOW_SECS) as usize].read(slot_tick, &mut slot_hist)
-            };
-
-            if with_series {
-                let unix_secs = unix.saturating_sub(age as i64);
-                series.push(match &loaded {
-                    Some((requests, status)) => {
-                        let [p50_ns, p95_ns, p99_ns, p999_ns] = slot_hist.percentiles();
-                        SecondSample {
-                            unix_secs,
-                            requests: *requests,
-                            status: *status,
-                            p50_ns,
-                            p95_ns,
-                            p99_ns,
-                            p999_ns,
-                        }
-                    }
-                    None => empty_sample(unix_secs),
-                });
-            }
-
-            let Some((requests, status)) = loaded else {
-                continue;
-            };
-            if requests == 0 {
-                continue;
-            }
-            requests_90 += requests;
-            add_status(&mut status_90, status);
-            hist_90.add_from(&slot_hist);
-            if age < WINDOW_60_SECS {
-                requests_60 += requests;
-                add_status(&mut status_60, status);
-                hist_60.add_from(&slot_hist);
-            }
-            if age < WINDOW_30_SECS {
-                requests_30 += requests;
-                add_status(&mut status_30, status);
-                hist_30.add_from(&slot_hist);
-            }
-        }
-
+        let mut fold = Fold {
+            window: self,
+            tick,
+            unix: if with_series { Some(unix_now()) } else { None },
+            slot_hist: LatencyHist::default(),
+            hist: LatencyHist::default(),
+            status: [0; 5],
+            requests: 0,
+            series: Vec::with_capacity(if with_series { WINDOW_SECS as usize } else { 0 }),
+        };
+        fold.walk(0..WINDOW_30_SECS);
+        let window_30 = fold.aggregate(WINDOW_30_SECS);
+        fold.walk(WINDOW_30_SECS..WINDOW_60_SECS);
+        let window_60 = fold.aggregate(WINDOW_60_SECS);
+        fold.walk(WINDOW_60_SECS..WINDOW_SECS);
+        let window_90 = fold.aggregate(WINDOW_SECS);
+        // The series was pushed newest first; the snapshot lists oldest first.
+        fold.series.reverse();
         TrafficSnapshot {
-            window_30: finish_agg(WINDOW_30_SECS, tick, requests_30, status_30, &hist_30),
-            window_60: finish_agg(WINDOW_60_SECS, tick, requests_60, status_60, &hist_60),
-            window_90: finish_agg(WINDOW_SECS, tick, requests_90, status_90, &hist_90),
-            series,
+            window_30,
+            window_60,
+            window_90,
+            series: fold.series,
         }
     }
 
@@ -421,13 +376,86 @@ impl SlidingWindow {
 
     /// Returns the current tick: whole seconds since `origin`.
     pub(crate) fn current_tick(&self) -> u64 {
-        self.origin.elapsed().as_secs() + self.extra_secs.load(Ordering::Relaxed)
+        self.tick_at(Instant::now())
+    }
+
+    /// Returns the tick of `now`: whole seconds since `origin`.
+    pub(crate) fn tick_at(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.origin).as_secs()
+            + self.extra_secs.load(Ordering::Relaxed)
     }
 
     /// Moves the clock forward by `secs` seconds.
     #[cfg(test)]
     pub(crate) fn advance_secs(&self, secs: u64) {
         self.extra_secs.fetch_add(secs, Ordering::Relaxed);
+    }
+}
+
+/// Running state of one [`SlidingWindow::fold`].
+struct Fold<'a> {
+    /// Ring being folded.
+    window: &'a SlidingWindow,
+    /// Tick the windows end at.
+    tick: u64,
+    /// Unix time of `tick`, or `None` when no series is built.
+    unix: Option<i64>,
+    /// Scratch histogram the current slot is loaded into.
+    slot_hist: LatencyHist,
+    /// Running total of every slot walked so far.
+    hist: LatencyHist,
+    /// Running per-class status counts.
+    status: [u64; 5],
+    /// Running request count.
+    requests: u64,
+    /// Per-second samples, newest first while walking.
+    series: Vec<SecondSample>,
+}
+
+impl Fold<'_> {
+    /// Merges the slots of the given ages, youngest first, into the running totals.
+    fn walk(&mut self, ages: std::ops::Range<u64>) {
+        for age in ages {
+            let loaded = if self.tick < age {
+                None
+            } else {
+                let slot_tick = self.tick - age;
+                self.window.slots[(slot_tick % WINDOW_SECS) as usize]
+                    .read(slot_tick, &mut self.slot_hist)
+            };
+
+            if let Some(unix) = self.unix {
+                let unix_secs = unix.saturating_sub(age as i64);
+                self.series.push(match &loaded {
+                    Some((requests, status)) => {
+                        let [p50_ns, p95_ns, p99_ns, p999_ns] = self.slot_hist.percentiles();
+                        SecondSample {
+                            unix_secs,
+                            requests: *requests,
+                            status: *status,
+                            p50_ns,
+                            p95_ns,
+                            p99_ns,
+                            p999_ns,
+                        }
+                    }
+                    None => empty_sample(unix_secs),
+                });
+            }
+
+            if let Some((requests, status)) = loaded
+                && requests != 0
+            {
+                self.requests += requests;
+                add_status(&mut self.status, status);
+                self.hist.add_from(&self.slot_hist);
+            }
+        }
+    }
+
+    /// Returns the running totals as the aggregate of a `window`-second window.
+    fn aggregate(&self, window: u64) -> WindowAgg {
+        finish_agg(window, self.tick, self.requests, self.status, &self.hist)
     }
 }
 
@@ -480,6 +508,18 @@ fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+/// Returns the `(bucket, status class index)` a request of `ns` nanoseconds with
+/// status class `status_class` (`1` to `5`) is recorded under.
+///
+/// The class index is `None` for a class outside `1xx` to `5xx`, which has no
+/// counter.
+pub(crate) fn sample_of(ns: u64, status_class: u8) -> (usize, Option<usize>) {
+    let class = (1..=5)
+        .contains(&status_class)
+        .then(|| usize::from(status_class - 1));
+    (bucket_of(ns), class)
 }
 
 /// Returns the index of the bucket that holds a latency of `ns` nanoseconds.

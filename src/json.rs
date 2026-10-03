@@ -1,3 +1,5 @@
+//! JSON extractor and response type backed by `sonic-rs`.
+
 use std::{
     fmt,
     ops::{Deref, DerefMut},
@@ -43,6 +45,11 @@ where
     T: DeserializeOwned,
 {
     /// Deserializes a JSON document with `sonic-rs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SonicJsonRejection::InvalidJson`] when `bytes` is not valid JSON
+    /// or does not match `T`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SonicJsonRejection> {
         sonic_rs::from_slice(bytes)
             .map(Self)
@@ -109,11 +116,11 @@ pub enum SonicJsonRejection {
 }
 
 impl SonicJsonRejection {
+    /// Returns the HTTP status this rejection is reported with.
     fn status(&self) -> StatusCode {
         match self {
             Self::MissingContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            Self::Body(_) => StatusCode::BAD_REQUEST,
-            Self::InvalidJson(_) => StatusCode::BAD_REQUEST,
+            Self::Body(_) | Self::InvalidJson(_) => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -146,6 +153,8 @@ impl IntoResponse for SonicJsonRejection {
     }
 }
 
+/// Returns `true` when `Content-Type` is `application/json` or an
+/// `application/*+json` structured-syntax type.
 fn is_json_content_type(headers: &HeaderMap) -> bool {
     let Some(content_type) = headers
         .get(header::CONTENT_TYPE)

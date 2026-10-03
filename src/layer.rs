@@ -1,3 +1,5 @@
+//! Tower middleware that records HTTP metrics for application traffic.
+
 use std::{
     future::Future,
     pin::Pin,
@@ -16,7 +18,9 @@ use crate::stats::{InFlightGuard, SharedStats};
 /// Tower layer that records HTTP metrics for non-monitor requests.
 #[derive(Clone)]
 pub struct MonitorLayer {
+    /// Counters of the monitor that created this layer.
     pub(crate) stats: Arc<SharedStats>,
+    /// Monitor route, whose requests are not recorded.
     pub(crate) skip_path: Arc<str>,
 }
 
@@ -32,10 +36,17 @@ impl<S> Layer<S> for MonitorLayer {
     }
 }
 
+/// Tower service produced by [`MonitorLayer`].
+///
+/// It records the request count, in-flight gauge, status class, and latency of
+/// every request whose path is not the monitor route.
 #[derive(Clone)]
 pub struct MonitorService<S> {
+    /// Wrapped service.
     inner: S,
+    /// Counters of the monitor that created the layer.
     stats: Arc<SharedStats>,
+    /// Monitor route, whose requests are not recorded.
     skip_path: Arc<str>,
 }
 
@@ -45,14 +56,22 @@ pin_project! {
     /// The in-flight guard is installed in [`Service::call`], so dropping this
     /// future without polling still releases the in-flight counter.
     pub struct MonitorFuture<F> {
+        // Field notes are plain comments: `pin_project!` accepts no doc attributes
+        // on fields.
+        //
+        // Future of the wrapped service.
         #[pin]
         inner: F,
+        // Recording state, or `None` for a request to the monitor route.
         recording: Option<Recording>,
     }
 }
 
+/// Per-request state of a recorded (non-monitor) request.
 struct Recording {
+    /// In-flight guard, taken when the response is recorded.
     guard: Option<InFlightGuard>,
+    /// Instant the request entered the service.
     started: Instant,
 }
 

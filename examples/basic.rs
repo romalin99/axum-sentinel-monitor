@@ -1,3 +1,5 @@
+//! Runs a demo Axum app with the monitor mounted and synthetic traffic.
+
 use std::{
     io::ErrorKind,
     net::SocketAddr,
@@ -17,20 +19,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 
+/// Identifier handed to the next created user.
 static NEXT_USER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Query string of `GET /search`.
 #[derive(Deserialize)]
 struct SearchParams {
     name: String,
     age: u32,
 }
 
+/// JSON body returned by `GET /search`.
 #[derive(Serialize)]
 struct SearchResponse {
     name: String,
     age: u32,
 }
 
+/// Returns a greeting for the queried name, and the queried age plus one, as JSON.
 async fn search(Query(params): Query<SearchParams>) -> SonicJson<SearchResponse> {
     SonicJson(SearchResponse {
         name: format!("{}你好", params.name),
@@ -38,12 +44,14 @@ async fn search(Query(params): Query<SearchParams>) -> SonicJson<SearchResponse>
     })
 }
 
+/// JSON body accepted by `POST /user`.
 #[derive(Deserialize)]
 struct CreateUser {
     name: String,
     age: u32,
 }
 
+/// JSON body returned by `POST /user`.
 #[derive(Serialize)]
 struct User {
     id: u64,
@@ -51,6 +59,7 @@ struct User {
     age: u32,
 }
 
+/// Creates a user from a JSON body and returns it with a fresh identifier.
 async fn create_user(SonicJson(input): SonicJson<CreateUser>) -> SonicJson<User> {
     SonicJson(User {
         id: NEXT_USER_ID.fetch_add(1, Ordering::Relaxed),
@@ -114,6 +123,7 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve app");
 }
 
+/// Sends a steady mix of requests so the dashboard has something to show.
 async fn generate_traffic(address: SocketAddr) {
     sleep(Duration::from_millis(250)).await;
     let paths = [
@@ -128,6 +138,8 @@ async fn generate_traffic(address: SocketAddr) {
         "/client-error",
         "/fail",
     ];
+    // Request errors are ignored throughout the loop: the traffic only exists to
+    // feed the dashboard, and the next round retries anyway.
     loop {
         for path in paths {
             let _ = http_get(address, path).await;
@@ -142,6 +154,7 @@ async fn generate_traffic(address: SocketAddr) {
     }
 }
 
+/// Sends a `GET` request for `path` and discards the response.
 async fn http_get(address: SocketAddr, path: &str) -> std::io::Result<()> {
     raw_http(
         address,
@@ -150,6 +163,7 @@ async fn http_get(address: SocketAddr, path: &str) -> std::io::Result<()> {
     .await
 }
 
+/// Sends a `POST /user` request with a JSON body and discards the response.
 async fn http_post_user(address: SocketAddr) -> std::io::Result<()> {
     let body = r#"{"name":"Alice","age":20}"#;
     raw_http(
@@ -162,6 +176,7 @@ async fn http_post_user(address: SocketAddr) -> std::io::Result<()> {
     .await
 }
 
+/// Writes a raw HTTP/1.1 request and waits for the first bytes of the response.
 async fn raw_http(address: SocketAddr, request: &str) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(address).await?;
     stream.write_all(request.as_bytes()).await?;

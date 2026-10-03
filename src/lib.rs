@@ -9,6 +9,24 @@
 //! tracked: once the table is full, routes with no request in the trailing 90s
 //! window are evicted first and the least recently used row goes first within
 //! that group, while rows with in-flight requests are never evicted.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use axum::{Router, routing::get};
+//! use axum_sentinel_monitor::Monitor;
+//!
+//! # async fn run() -> std::io::Result<()> {
+//! let monitor = Monitor::default();
+//! let app = Router::new()
+//!     .route("/", get(|| async { "Hello from Axum" }))
+//!     .merge(monitor.router())
+//!     .layer(monitor.layer());
+//!
+//! let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+//! axum::serve(listener, app).await
+//! # }
+//! ```
 
 mod collect;
 mod config;
@@ -20,7 +38,7 @@ mod layer;
 mod snapshot;
 mod stats;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::{
     Router,
@@ -45,14 +63,22 @@ pub use snapshot::{
 /// Shared monitor handle used to create the endpoint and request-counting layer.
 #[derive(Clone)]
 pub struct Monitor {
+    /// Normalized configuration.
     config: Arc<Config>,
+    /// Counters and snapshot cache shared with every layer of this monitor.
     stats: Arc<stats::SharedStats>,
+    /// Pre-rendered dashboard page; empty in `api_only` mode.
     dashboard: Bytes,
+    /// JSON encoding of the snapshot served last.
     encoded: Arc<Mutex<Option<EncodedSnapshot>>>,
 }
 
+/// JSON encoding of the snapshot it was produced from, kept so that polls
+/// hitting the same cached snapshot share one serialization.
 struct EncodedSnapshot {
+    /// Snapshot the bytes were encoded from, compared by pointer.
     source: Arc<Snapshot>,
+    /// Encoded JSON document.
     body: Bytes,
 }
 
@@ -63,7 +89,9 @@ impl Default for Monitor {
 }
 
 impl Monitor {
-    /// Creates a monitor. Snapshots are collected on demand and cached for `refresh`.
+    /// Creates a monitor from `config`.
+    ///
+    /// Snapshots are collected on demand and cached for [`Config::refresh`].
     pub fn new(config: Config) -> Self {
         let config = Arc::new(config.normalized());
         let stats = stats::SharedStats::new(config.refresh);
@@ -110,7 +138,7 @@ impl Monitor {
         self.stats.snapshot()
     }
 
-    /// Returns the latest metrics snapshot, collecting when the cache is cold.
+    /// Returns the latest metrics snapshot; an alias of [`Self::stats`].
     pub fn snapshot(&self) -> Snapshot {
         self.stats()
     }
@@ -127,6 +155,8 @@ impl Monitor {
         &self.config
     }
 
+    /// Returns the current snapshot encoded as JSON.
+    ///
     /// Cold collection and serialization run on the blocking pool. Cache hits
     /// return shared encoded bytes without scheduling another blocking task.
     async fn collect_json(&self) -> Result<Bytes, String> {
@@ -145,6 +175,7 @@ impl Monitor {
         }
     }
 
+    /// Serves the monitor route: JSON when negotiated or `api_only`, HTML otherwise.
     async fn respond(&self, method: Method, headers: HeaderMap) -> Response {
         if method != Method::GET {
             return (
@@ -195,13 +226,13 @@ impl Monitor {
     }
 }
 
+/// Serializes `snapshot`, reusing the cached bytes when it is the snapshot that
+/// was encoded last.
 fn encode_snapshot(
     cache: &Mutex<Option<EncodedSnapshot>>,
     snapshot: Arc<Snapshot>,
 ) -> Result<Bytes, String> {
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(encoded) = cache.as_ref()
         && Arc::ptr_eq(&encoded.source, &snapshot)
     {
@@ -217,6 +248,8 @@ fn encode_snapshot(
     Ok(body)
 }
 
+/// Returns `true` when the `Accept` header ranks `application/json` above
+/// `text/html`.
 fn prefers_json(headers: &HeaderMap) -> bool {
     let Some(accept) = headers.get(ACCEPT).and_then(|value| value.to_str().ok()) else {
         return false;
@@ -231,6 +264,7 @@ fn prefers_json(headers: &HeaderMap) -> bool {
     }
 }
 
+/// Splits an `Accept` header into `(type, subtype, quality)` media ranges.
 fn parse_accept(value: &str) -> Vec<(&str, &str, f32)> {
     value
         .split(',')
@@ -251,6 +285,8 @@ fn parse_accept(value: &str) -> Vec<(&str, &str, f32)> {
         .collect()
 }
 
+/// Returns the `(quality, specificity)` of the most specific range matching the
+/// candidate media type, or `None` when no range matches.
 fn candidate_quality(
     ranges: &[(&str, &str, f32)],
     candidate_kind: &str,

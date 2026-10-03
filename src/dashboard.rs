@@ -1,9 +1,14 @@
+//! Rendering of the embedded HTML dashboard.
+
 use crate::Config;
 
+/// Dashboard page template; `__MONITOR_*__` placeholders are filled by [`render`].
 const DASHBOARD: &str = include_str!("dashboard.html");
 
+/// Built-in SVG favicon as a `data:` URL, used when the config sets none.
 const DEFAULT_FAVICON: &str = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+CjxyZWN0IHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgcng9IjE0IiBmaWxsPSIjMGYxNzJhIi8+CjxwYXRoIGQ9Ik04IDM0aDEzbDYtMTcgMTEgMzIgNy0yMCA0IDVoNyIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjNjdlOGY5IiBzdHJva2Utd2lkdGg9IjYiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgo8L3N2Zz4=";
 
+/// Renders the dashboard page for `config`, HTML-escaping every configured text.
 pub(crate) fn render(config: &Config) -> String {
     let refresh_ms = config
         .refresh
@@ -27,6 +32,7 @@ pub(crate) fn render(config: &Config) -> String {
         .replace("__MONITOR_PID__", &std::process::id().to_string())
 }
 
+/// Escapes `value` for use in HTML text content.
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -36,6 +42,7 @@ fn escape_html(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Escapes `value` for use in a double-quoted HTML attribute.
 fn escape_attr(value: &str) -> String {
     escape_html(value)
 }

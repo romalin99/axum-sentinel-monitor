@@ -1,3 +1,5 @@
+//! Collection of process, runtime, system, and HTTP metrics into a snapshot.
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -7,7 +9,7 @@ use sysinfo::{
     System,
 };
 
-use crate::histogram::{WINDOW_SECS, window_rates};
+use crate::histogram::{WINDOW_SECS, WindowAgg, window_rates};
 use crate::snapshot::{
     CollectionStats, HttpEndpointStats, HttpRateStats, HttpSecondSample, HttpStats,
     HttpStatusStats, HttpWindowStats, HttpWindows, LatencyStats, ProcessStats, RuntimeStats,
@@ -15,38 +17,64 @@ use crate::snapshot::{
 };
 use crate::stats::HttpMetrics;
 
-/// Disk usage is sampled at most this often. Reading it costs ~20ms per call
-/// (the per-mount `statfs` dominates, not the enumeration — refreshing a
-/// resident `Disks` is no cheaper than rebuilding it), and the figure moves far
-/// too slowly to be worth that on every dashboard poll.
+/// Minimum interval between disk usage samples.
+///
+/// Reading disk usage costs ~20ms per call (the per-mount `statfs` dominates,
+/// not the enumeration — refreshing a resident `Disks` is no cheaper than
+/// rebuilding it), and the figure moves far too slowly to be worth that on every
+/// dashboard poll.
 const DISK_TTL: Duration = Duration::from_secs(30);
 
-/// Open-descriptor listing walks `/proc/self/fd` (or `/dev/fd`), so the cost
-/// grows with connection count. The figure is stable enough to share across
-/// several dashboard polls.
+/// Minimum interval between open-descriptor counts.
+///
+/// The listing walks `/proc/self/fd` (or `/dev/fd`), so the cost grows with
+/// connection count. The figure is stable enough to share across several
+/// dashboard polls.
 const FD_TTL: Duration = Duration::from_secs(5);
 
+/// Samples process, runtime, system, and HTTP metrics into a [`Snapshot`].
+///
+/// CPU and network figures are deltas against the previous collection, so the
+/// collector keeps the last sample and reports `None` on the first pass.
 pub(crate) struct Collector {
+    /// CPU, memory, and process sampler.
     system: System,
+    /// Network interface counters.
     networks: Networks,
+    /// Disks enumerated at startup.
     disks: Disks,
+    /// Canonical working directory, used to pick the disk to report.
     disk_root: Option<PathBuf>,
+    /// Disk usage read last, or `None` when the lookup failed.
     disk_cache: Option<DiskUsage>,
+    /// Instant `disk_cache` was read, or `None` before the first read.
     disk_at: Option<Instant>,
+    /// Open-descriptor count read last, or `None` when the listing failed.
     fd_cache: Option<i32>,
+    /// Instant `fd_cache` was read, or `None` before the first read.
     fd_at: Option<Instant>,
+    /// Identifier of this process.
     pid: Pid,
+    /// Logical CPU count, used to scale process CPU usage to the whole machine.
     num_cpu: usize,
+    /// Instant the collector was created; the origin of the reported uptime.
     started: Instant,
+    /// Whether a process CPU sample exists to diff against.
     process_cpu_seen: bool,
+    /// Whether a system CPU sample exists to diff against.
     system_cpu_seen: bool,
+    /// Whether a network sample exists to diff against.
     network_seen: bool,
+    /// Total bytes received as of the previous collection.
     network_received: u64,
+    /// Total bytes sent as of the previous collection.
     network_sent: u64,
+    /// Instant of the previous collection.
     network_at: Instant,
 }
 
 impl Collector {
+    /// Creates a collector, enumerating CPUs, network interfaces, and disks once.
     pub(crate) fn new() -> Self {
         let mut system = System::new();
         system.refresh_cpu_list(CpuRefreshKind::nothing().with_cpu_usage());
@@ -81,6 +109,8 @@ impl Collector {
         }
     }
 
+    /// Collects a snapshot, listing every metric that failed in
+    /// [`CollectionStats::errors`] instead of failing as a whole.
     pub(crate) fn collect(&mut self, http: &HttpMetrics) -> Snapshot {
         let now = Instant::now();
         let mut errors = Vec::new();
@@ -99,6 +129,8 @@ impl Collector {
         }
     }
 
+    /// Samples this process, pushing the name of each unavailable metric onto
+    /// `errors`.
     fn collect_process(&mut self, errors: &mut Vec<String>) -> ProcessStats {
         let mut stats = ProcessStats {
             uptime_seconds: self.started.elapsed().as_secs(),
@@ -146,6 +178,7 @@ impl Collector {
         stats
     }
 
+    /// Samples the host, pushing the name of each unavailable metric onto `errors`.
     fn collect_system(&mut self, now: Instant, errors: &mut Vec<String>) -> SystemStats {
         let mut stats = SystemStats::default();
 
@@ -220,14 +253,9 @@ impl Collector {
         stats
     }
 
+    /// Converts the live HTTP counters and windows into their snapshot form.
     fn collect_http(&self, http: &HttpMetrics) -> HttpStats {
-        let status = HttpStatusStats {
-            status_1xx: http.status1(),
-            status_2xx: http.status2(),
-            status_3xx: http.status3(),
-            status_4xx: http.status4(),
-            status_5xx: http.status5(),
-        };
+        let status = status_from_counts(http.status_counts());
         let traffic = http.latency().snapshot();
         let window_30 = to_window_stats(&traffic.window_30);
         let window_60 = to_window_stats(&traffic.window_60);
@@ -277,7 +305,8 @@ impl Collector {
     }
 }
 
-fn to_window_stats(agg: &crate::histogram::WindowAgg) -> HttpWindowStats {
+/// Converts an internal window aggregate into its public snapshot form.
+fn to_window_stats(agg: &WindowAgg) -> HttpWindowStats {
     let (rate_4xx, rate_5xx) = window_rates(&agg.status, agg.requests);
     HttpWindowStats {
         seconds: agg.seconds,
@@ -298,6 +327,7 @@ fn to_window_stats(agg: &crate::histogram::WindowAgg) -> HttpWindowStats {
     }
 }
 
+/// Maps per-class counts, indexed `1xx` to `5xx`, onto named fields.
 fn status_from_counts(counts: [u64; 5]) -> HttpStatusStats {
     HttpStatusStats {
         status_1xx: counts[0],
@@ -308,19 +338,26 @@ fn status_from_counts(counts: [u64; 5]) -> HttpStatusStats {
     }
 }
 
+/// Usage of the disk that holds the process working directory.
 #[derive(Clone)]
 struct DiskUsage {
+    /// Used space in percent of the total.
     used_percent: f64,
+    /// Used space in bytes.
     used: u64,
+    /// Total space in bytes.
     total: u64,
+    /// Space in bytes available to the process.
     free: u64,
+    /// File-system name, possibly empty.
     fs_type: String,
 }
 
 impl Collector {
-    /// Returns the cached disk usage, refreshing it at most once per
-    /// [`DISK_TTL`]. Mount points and file-system names are those captured at
-    /// startup; only storage figures are re-read.
+    /// Returns the cached disk usage, refreshing it at most once per [`DISK_TTL`].
+    ///
+    /// Mount points and file-system names are those captured at startup; only
+    /// storage figures are re-read.
     fn application_disk(&mut self) -> Option<DiskUsage> {
         if let Some(at) = self.disk_at
             && at.elapsed() < DISK_TTL
@@ -333,10 +370,12 @@ impl Collector {
         // Stamped even when the lookup fails, so a missing mount does not turn
         // into a ~20ms probe on every collect.
         self.disk_at = Some(Instant::now());
-        self.disk_cache = usage.clone();
+        self.disk_cache.clone_from(&usage);
         usage
     }
 
+    /// Returns the cached open-descriptor count, refreshing it at most once per
+    /// [`FD_TTL`].
     fn cached_descriptors(&mut self) -> Option<i32> {
         if let Some(at) = self.fd_at
             && at.elapsed() < FD_TTL
@@ -349,6 +388,7 @@ impl Collector {
         count
     }
 
+    /// Reads usage of the longest mount point that contains the working directory.
     fn read_disk(&self) -> Option<DiskUsage> {
         let root = self.disk_root.as_deref()?;
         let disk = self
@@ -373,10 +413,12 @@ impl Collector {
     }
 }
 
+/// Returns `true` when `path` lies on `mount`, comparing whole path components.
 fn path_on_mount(path: &Path, mount: &Path) -> bool {
     path.starts_with(mount)
 }
 
+/// Samples the Tokio runtime and the allocator.
 fn collect_runtime() -> RuntimeStats {
     let (tasks, workers) = tokio_runtime_counts();
     let heap = allocator_stats();
@@ -391,24 +433,33 @@ fn collect_runtime() -> RuntimeStats {
     }
 }
 
+/// Heap figures in bytes, shaped after Go's `runtime.MemStats`.
 #[derive(Default)]
 struct AllocatorStats {
+    /// Bytes handed out by the allocator and still in use (Go `HeapAlloc`).
     alloc_bytes: u64,
     /// Page-granular in-use bytes (Go `HeapInuse`); equals `alloc_bytes` where the
     /// allocator exposes no such figure.
     inuse_bytes: u64,
+    /// Address space obtained from the OS (Go `HeapSys`).
     sys_bytes: u64,
+    /// Free bytes inside the heap (Go `HeapIdle`).
     idle_bytes: u64,
+    /// Bytes the kernel no longer keeps resident (Go `HeapReleased`).
     released_bytes: u64,
 }
 
-/// jemalloc (`tikv-jemalloc-ctl`, feature `jemalloc`): Go `MemStats` mapping over
-/// `stats.*` — `HeapAlloc` = allocated, `HeapInuse` = active, `HeapSys` = mapped + retained
-/// (address space obtained, including what was handed back), `HeapReleased` = retained +
-/// (mapped − resident) (pages the kernel no longer holds), `HeapIdle` = sys − active.
-/// `heap_sys − heap_released` therefore equals jemalloc's own `resident`. Statistics are
-/// cached by jemalloc and refreshed by advancing the epoch first. A failed mallctl read
-/// yields zeros (the allocator is not jemalloc, or stats were compiled out).
+/// Reads heap figures from jemalloc's `stats.*` (feature `jemalloc`).
+///
+/// The Go `MemStats` mapping is: `HeapAlloc` = allocated, `HeapInuse` = active,
+/// `HeapSys` = mapped + retained (address space obtained, including what was
+/// handed back), `HeapReleased` = retained + (mapped − resident) (pages the
+/// kernel no longer holds), `HeapIdle` = sys − active. `heap_sys − heap_released`
+/// therefore equals jemalloc's own `resident`.
+///
+/// Statistics are cached by jemalloc and refreshed by advancing the epoch first.
+/// A failed mallctl read yields zeros (the allocator is not jemalloc, or stats
+/// were compiled out).
 #[cfg(feature = "jemalloc")]
 fn allocator_stats() -> AllocatorStats {
     use tikv_jemalloc_ctl::{epoch, stats};
@@ -435,6 +486,8 @@ fn allocator_stats() -> AllocatorStats {
     }
 }
 
+/// Returns `(live tasks, worker threads)` of the current Tokio runtime, falling
+/// back to OS threads and available parallelism outside a runtime.
 fn tokio_runtime_counts() -> (u64, i32) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
@@ -445,17 +498,15 @@ fn tokio_runtime_counts() -> (u64, i32) {
             )
         }
         Err(_) => {
-            let tasks = num_threads::num_threads()
-                .map(|threads| threads.get() as u64)
-                .unwrap_or(0);
-            let workers = std::thread::available_parallelism()
-                .map(|value| value.get() as i32)
-                .unwrap_or(1);
+            let tasks = num_threads::num_threads().map_or(0, |threads| threads.get() as u64);
+            let workers =
+                std::thread::available_parallelism().map_or(1, |value| value.get() as i32);
             (tasks, workers)
         }
     }
 }
 
+/// Reads heap figures from glibc's `mallinfo2`.
 #[cfg(all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"))]
 fn allocator_stats() -> AllocatorStats {
     #[repr(C)]
@@ -474,6 +525,8 @@ fn allocator_stats() -> AllocatorStats {
     unsafe extern "C" {
         fn mallinfo2() -> Mallinfo2;
     }
+    // SAFETY: `mallinfo2` takes no arguments and returns its bookkeeping by
+    // value; `Mallinfo2` mirrors the layout of glibc's `struct mallinfo2`.
     let info = unsafe { mallinfo2() };
     let sys_bytes = info.arena.saturating_add(info.hblkhd) as u64;
     let idle_bytes = info.fordblks as u64;
@@ -483,10 +536,9 @@ fn allocator_stats() -> AllocatorStats {
     // to the kernel are the part of the heap that is no longer resident, which the
     // kernel does expose (RssAnon in /proc/self/status). `keepcost` is only the
     // releasable top chunk of the main arena and is not that number.
-    let released_bytes = match resident_anonymous_bytes() {
-        Some(resident) => reconcile_released(sys_bytes, idle_bytes, resident),
-        None => 0,
-    };
+    let released_bytes = resident_anonymous_bytes().map_or(0, |resident| {
+        reconcile_released(sys_bytes, idle_bytes, resident)
+    });
     AllocatorStats {
         alloc_bytes: info.uordblks as u64,
         inuse_bytes: info.uordblks as u64,
@@ -496,32 +548,32 @@ fn allocator_stats() -> AllocatorStats {
     }
 }
 
-/// Bytes of heap address space the kernel no longer keeps resident
-/// (Go's `HeapReleased`): `heap_sys - resident anonymous memory`, kept inside the
+/// Returns the bytes of heap address space the kernel no longer keeps resident
+/// (Go's `HeapReleased`).
+///
+/// The value is `heap_sys - resident anonymous memory`, kept inside the
 /// `released <= idle <= sys` invariant so `sys - released` never exceeds RSS.
 ///
-/// `resident` is RssAnon, which also counts thread stacks and non-malloc anonymous
-/// mappings, so the result is a lower bound: a few MB of stacks read as "still
-/// resident heap". On a trimmed process the error is small next to the pages returned.
+/// `resident_anonymous` is `RssAnon`, which also counts thread stacks and
+/// non-malloc anonymous mappings, so the result is a lower bound: a few MB of
+/// stacks read as "still resident heap". On a trimmed process the error is small
+/// next to the pages returned.
 #[cfg(any(
     all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"),
     test
 ))]
 fn reconcile_released(sys_bytes: u64, idle_bytes: u64, resident_anonymous: u64) -> u64 {
-    sys_bytes
-        .saturating_sub(resident_anonymous)
-        .min(idle_bytes)
-        .min(sys_bytes)
+    sys_bytes.saturating_sub(resident_anonymous).min(idle_bytes)
 }
 
-/// `RssAnon` from `/proc/self/status`, in bytes.
+/// Returns `RssAnon` from `/proc/self/status`, in bytes.
 #[cfg(all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"))]
 fn resident_anonymous_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     parse_rss_anon_kb(&status).map(|kb| kb.saturating_mul(1024))
 }
 
-/// Pull the `RssAnon:` value (kB) out of a `/proc/<pid>/status` body.
+/// Pulls the `RssAnon:` value (kB) out of a `/proc/<pid>/status` body.
 #[cfg(any(
     all(not(feature = "jemalloc"), target_os = "linux", target_env = "gnu"),
     test
@@ -534,6 +586,7 @@ fn parse_rss_anon_kb(status: &str) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
+/// Reads heap figures from the default malloc zone.
 #[cfg(all(not(feature = "jemalloc"), target_os = "macos"))]
 fn allocator_stats() -> AllocatorStats {
     #[repr(C)]
@@ -548,6 +601,9 @@ fn allocator_stats() -> AllocatorStats {
         fn malloc_default_zone() -> *mut MallocZone;
         fn malloc_zone_statistics(zone: *mut MallocZone, stats: *mut MallocStatistics);
     }
+    // SAFETY: `malloc_default_zone` takes no arguments, and its result is checked
+    // for null before use. `stats` is a live, exclusively borrowed value whose
+    // layout mirrors `malloc_statistics_t`, which `malloc_zone_statistics` fills.
     unsafe {
         let zone = malloc_default_zone();
         if zone.is_null() {
@@ -570,6 +626,7 @@ fn allocator_stats() -> AllocatorStats {
     }
 }
 
+/// Returns zeros: this platform's allocator exposes no heap figures.
 #[cfg(not(any(
     feature = "jemalloc",
     all(target_os = "linux", target_env = "gnu"),
@@ -579,6 +636,7 @@ fn allocator_stats() -> AllocatorStats {
     AllocatorStats::default()
 }
 
+/// Counts the open file descriptors of this process.
 #[cfg(unix)]
 fn open_descriptors() -> Option<i32> {
     let path = if cfg!(target_os = "linux") {
@@ -589,6 +647,7 @@ fn open_descriptors() -> Option<i32> {
     std::fs::read_dir(path).ok().map(iter_count_saturating)
 }
 
+/// Counts the open handles of this process.
 #[cfg(windows)]
 fn open_descriptors() -> Option<i32> {
     use std::os::raw::{c_int, c_void};
@@ -597,27 +656,33 @@ fn open_descriptors() -> Option<i32> {
         fn GetProcessHandleCount(process: *mut c_void, count: *mut u32) -> c_int;
     }
     let mut count = 0u32;
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that is always valid,
+    // and `count` is a live `u32` the call writes through.
     let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
     if ok != 0 { Some(count as i32) } else { None }
 }
 
+/// Returns `None`: this platform has no descriptor listing.
 #[cfg(not(any(unix, windows)))]
 fn open_descriptors() -> Option<i32> {
     None
 }
 
+/// Counts the items of `iter`, saturating at `i32::MAX`.
 #[cfg(unix)]
 fn iter_count_saturating<T>(iter: impl Iterator<Item = T>) -> i32 {
     let count = iter.count();
     i32::try_from(count).unwrap_or(i32::MAX)
 }
 
+/// Returns `(receive, send)` rates in bytes per second, or `None` for both when
+/// no time has elapsed or a counter went backwards.
 fn network_rates(
     previous_received: u64,
     previous_sent: u64,
     current_received: u64,
     current_sent: u64,
-    elapsed: std::time::Duration,
+    elapsed: Duration,
 ) -> (Option<f64>, Option<f64>) {
     if elapsed.is_zero() || current_received < previous_received || current_sent < previous_sent {
         return (None, None);
@@ -629,6 +694,7 @@ fn network_rates(
     )
 }
 
+/// Clamps `value` to the 0–100 percent range.
 fn clamp_percent(value: f64) -> f64 {
     value.clamp(0.0, 100.0)
 }

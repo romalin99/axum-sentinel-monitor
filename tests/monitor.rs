@@ -1,3 +1,5 @@
+//! Integration tests for the public monitor router and layer.
+
 use std::time::Duration;
 
 use axum::{
@@ -11,6 +13,7 @@ use http_body_util::BodyExt;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value};
 use tower::ServiceExt;
 
+/// Reads a response body to the end as UTF-8 text.
 async fn body(response: axum::response::Response) -> String {
     let bytes = response
         .into_body()

@@ -1,22 +1,40 @@
+//! Lock-free sliding-window latency histogram over one-second slots.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// Length in seconds of the ring, and of its longest window.
 pub(crate) const WINDOW_SECS: u64 = 90;
+/// Length in seconds of the short window.
 pub(crate) const WINDOW_30_SECS: u64 = 30;
+/// Length in seconds of the medium window.
 pub(crate) const WINDOW_60_SECS: u64 = 60;
 
+/// Log2 of the number of sub-buckets each power of two is split into.
 const SUB_BITS: u32 = 3;
+/// Sub-buckets per power of two, which bounds the relative error at 12.5%.
 const SUB: u64 = 1 << SUB_BITS;
+/// Largest latency recorded; longer requests are clamped to it.
 const MAX_LATENCY_NS: u64 = 60_000_000_000;
+/// Exponent of the first power of two, in nanoseconds, above [`MAX_LATENCY_NS`];
+/// the buckets cover every latency below `2^MAX_LOG` ns.
 const MAX_LOG: u32 = 36;
+/// Bucket count: [`SUB`] linear buckets below `SUB` ns, then [`SUB`] per power of
+/// two.
 const BUCKETS: usize = SUB as usize + ((MAX_LOG - SUB_BITS) as usize) * SUB as usize;
+/// Slot tick meaning the slot has never been written.
 const TICK_EMPTY: u64 = u64::MAX;
+/// Slot tick meaning a writer is clearing the slot for a new second.
 const TICK_RESETTING: u64 = u64::MAX - 1;
+/// Reported percentiles in permille: P50, P95, P99, and P99.9.
 const PERCENTILES: [u32; 4] = [500, 950, 990, 999];
 
+/// Plain (non-atomic) latency histogram used to merge slots while folding.
 struct LatencyHist {
+    /// Samples per latency bucket.
     buckets: [u64; BUCKETS],
+    /// Total samples across all buckets.
     count: u64,
 }
 
@@ -30,6 +48,7 @@ impl Default for LatencyHist {
 }
 
 impl LatencyHist {
+    /// Adds `count` samples to bucket `index`.
     fn add_bucket(&mut self, index: usize, count: u64) {
         if count == 0 || index >= BUCKETS {
             return;
@@ -38,6 +57,7 @@ impl LatencyHist {
         self.count += count;
     }
 
+    /// Merges every bucket of `other` into this histogram.
     fn add_from(&mut self, other: &Self) {
         if other.count == 0 {
             return;
@@ -50,6 +70,7 @@ impl LatencyHist {
         }
     }
 
+    /// Empties the histogram, skipping the walk when it is already empty.
     fn reset(&mut self) {
         if self.count == 0 {
             return;
@@ -58,6 +79,8 @@ impl LatencyHist {
         self.count = 0;
     }
 
+    /// Returns the [`PERCENTILES`] as bucket upper bounds in nanoseconds, or all
+    /// `None` when the histogram is empty.
     fn percentiles(&self) -> [Option<u64>; PERCENTILES.len()] {
         if self.count == 0 {
             return [None; PERCENTILES.len()];
@@ -85,14 +108,20 @@ impl LatencyHist {
     }
 }
 
+/// Lock-free counters of one second of the ring.
 struct Slot {
+    /// Second this slot currently holds, or [`TICK_EMPTY`] / [`TICK_RESETTING`].
     tick: AtomicU64,
+    /// Requests completed in this second.
     requests: AtomicU32,
+    /// Responses per status class, indexed `1xx` to `5xx`.
     status: [AtomicU32; 5],
+    /// Samples per latency bucket.
     buckets: [AtomicU32; BUCKETS],
 }
 
 impl Slot {
+    /// Creates a slot that holds no second yet.
     fn new() -> Self {
         Self {
             tick: AtomicU64::new(TICK_EMPTY),
@@ -102,6 +131,7 @@ impl Slot {
         }
     }
 
+    /// Zeroes every counter; the caller must hold the slot in [`TICK_RESETTING`].
     fn clear(&self) {
         self.requests.store(0, Ordering::Relaxed);
         for count in &self.status {
@@ -112,8 +142,11 @@ impl Slot {
         }
     }
 
-    /// Loads this slot when it still belongs to `expected_tick`. Empty seconds
-    /// skip the 272-bucket walk. `hist` is always reset before returning.
+    /// Loads this slot into `hist` when it still belongs to `expected_tick`.
+    ///
+    /// Returns the request and per-class status counts, or `None` when the slot
+    /// holds, or was recycled for, another second. Empty seconds skip the
+    /// 272-bucket walk. `hist` is always reset before it is filled.
     fn read(&self, expected_tick: u64, hist: &mut LatencyHist) -> Option<(u64, [u64; 5])> {
         hist.reset();
         if self.tick.load(Ordering::Acquire) != expected_tick {
@@ -136,49 +169,81 @@ impl Slot {
     }
 }
 
+/// Ring of one-second [`Slot`]s covering the trailing [`WINDOW_SECS`] seconds.
+///
+/// A tick is the number of whole seconds since `origin`; slot `tick % WINDOW_SECS`
+/// is recycled by the first writer that reaches a newer second.
 pub(crate) struct SlidingWindow {
+    /// Instant that tick zero is measured from.
     origin: Instant,
+    /// Seconds added to the tick; non-zero only when tests advance time.
     extra_secs: Arc<AtomicU64>,
+    /// One slot per second of the ring.
     slots: [Slot; WINDOW_SECS as usize],
 }
 
+/// Traffic aggregated over one trailing window.
 #[derive(Clone, Debug)]
 pub(crate) struct WindowAgg {
+    /// Nominal window length in seconds.
     pub seconds: u32,
+    /// Seconds of the window elapsed since tick zero.
     pub covered_seconds: u32,
+    /// Requests completed inside the window.
     pub requests: u64,
+    /// Requests per second over `covered_seconds`.
     pub rps: f64,
+    /// Responses per status class, indexed `1xx` to `5xx`.
     pub status: [u64; 5],
+    /// Median latency in nanoseconds, or `None` without requests.
     pub p50_ns: Option<u64>,
+    /// 95th-percentile latency in nanoseconds, or `None` without requests.
     pub p95_ns: Option<u64>,
+    /// 99th-percentile latency in nanoseconds, or `None` without requests.
     pub p99_ns: Option<u64>,
+    /// 99.9th-percentile latency in nanoseconds, or `None` without requests.
     pub p999_ns: Option<u64>,
 }
 
+/// Traffic of a single second of the ring.
 #[derive(Clone, Debug)]
 pub(crate) struct SecondSample {
+    /// Unix timestamp of the second.
     pub unix_secs: i64,
+    /// Requests completed in the second.
     pub requests: u64,
+    /// Responses per status class, indexed `1xx` to `5xx`.
     pub status: [u64; 5],
+    /// Median latency in nanoseconds, or `None` without requests.
     pub p50_ns: Option<u64>,
+    /// 95th-percentile latency in nanoseconds, or `None` without requests.
     pub p95_ns: Option<u64>,
+    /// 99th-percentile latency in nanoseconds, or `None` without requests.
     pub p99_ns: Option<u64>,
+    /// 99.9th-percentile latency in nanoseconds, or `None` without requests.
     pub p999_ns: Option<u64>,
 }
 
+/// The three window aggregates plus the per-second series, oldest first.
 #[derive(Clone, Debug)]
 pub(crate) struct TrafficSnapshot {
+    /// Aggregate of the trailing 30 seconds.
     pub window_30: WindowAgg,
+    /// Aggregate of the trailing 60 seconds.
     pub window_60: WindowAgg,
+    /// Aggregate of the trailing 90 seconds.
     pub window_90: WindowAgg,
+    /// One sample per second, oldest first; empty when the series was not requested.
     pub series: Vec<SecondSample>,
 }
 
 impl SlidingWindow {
+    /// Creates an empty window whose tick zero is now.
     pub(crate) fn new() -> Self {
         Self::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)))
     }
 
+    /// Creates an empty window on an existing time base.
     pub(crate) fn with_clock(origin: Instant, extra_secs: Arc<AtomicU64>) -> Self {
         Self {
             origin,
@@ -187,19 +252,25 @@ impl SlidingWindow {
         }
     }
 
+    /// Returns the instant tick zero is measured from.
     pub(crate) fn origin(&self) -> Instant {
         self.origin
     }
 
+    /// Returns the shared tick offset, non-zero only when tests advance time.
     pub(crate) fn extra_secs(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.extra_secs)
     }
 
+    /// Records one request of `ns` nanoseconds at the current tick.
     #[cfg(test)]
     pub(crate) fn observe(&self, ns: u64, status_class: u8) {
         self.observe_at(self.current_tick(), ns, status_class);
     }
 
+    /// Records one request of `ns` nanoseconds in the slot of `tick`.
+    ///
+    /// The sample is dropped when the slot has already moved on to a newer second.
     pub(crate) fn observe_at(&self, tick: u64, ns: u64, status_class: u8) {
         let index = bucket_of(ns);
         let status = (1..=5)
@@ -218,21 +289,25 @@ impl SlidingWindow {
         slot.buckets[index].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Returns the window aggregates and the per-second series as of now.
     pub(crate) fn snapshot(&self) -> TrafficSnapshot {
         self.fold(true, self.current_tick())
     }
 
-    /// 30s/60s/90s aggregates without the 90-point series or per-second percentiles.
+    /// Returns the 30s/60s/90s aggregates without the 90-point series or
+    /// per-second percentiles.
     #[cfg(test)]
     pub(crate) fn snapshot_windows(&self) -> (WindowAgg, WindowAgg, WindowAgg) {
         self.snapshot_windows_at(self.current_tick())
     }
 
+    /// Returns the 30s/60s/90s aggregates of the windows ending at `tick`.
     pub(crate) fn snapshot_windows_at(&self, tick: u64) -> (WindowAgg, WindowAgg, WindowAgg) {
         let folded = self.fold(false, tick);
         (folded.window_30, folded.window_60, folded.window_90)
     }
 
+    /// Returns the 30s/60s/90s aggregates of a window without any request.
     pub(crate) fn empty_windows(tick: u64) -> (WindowAgg, WindowAgg, WindowAgg) {
         let hist = LatencyHist::default();
         (
@@ -242,6 +317,8 @@ impl SlidingWindow {
         )
     }
 
+    /// Walks the ring once, oldest second first, accumulating all three windows
+    /// and, when `with_series` is set, the per-second series.
     fn fold(&self, with_series: bool, tick: u64) -> TrafficSnapshot {
         let unix = if with_series { unix_now() } else { 0 };
         let mut hist_30 = LatencyHist::default();
@@ -312,6 +389,9 @@ impl SlidingWindow {
         }
     }
 
+    /// Returns the slot of `tick`, recycling it when it holds an older second.
+    ///
+    /// Returns `None` when the slot already belongs to a newer second.
     fn slot_for(&self, tick: u64) -> Option<&Slot> {
         let slot = &self.slots[(tick % WINDOW_SECS) as usize];
         loop {
@@ -339,16 +419,19 @@ impl SlidingWindow {
         }
     }
 
+    /// Returns the current tick: whole seconds since `origin`.
     pub(crate) fn current_tick(&self) -> u64 {
         self.origin.elapsed().as_secs() + self.extra_secs.load(Ordering::Relaxed)
     }
 
+    /// Moves the clock forward by `secs` seconds.
     #[cfg(test)]
     pub(crate) fn advance_secs(&self, secs: u64) {
         self.extra_secs.fetch_add(secs, Ordering::Relaxed);
     }
 }
 
+/// Builds the aggregate of a `window`-second window ending at `tick`.
 fn finish_agg(
     window: u64,
     tick: u64,
@@ -371,12 +454,14 @@ fn finish_agg(
     }
 }
 
+/// Adds the per-class counts of `src` onto `dst`.
 fn add_status(dst: &mut [u64; 5], src: [u64; 5]) {
     for (dst, src) in dst.iter_mut().zip(src) {
         *dst += src;
     }
 }
 
+/// Returns the sample of a second without any request.
 fn empty_sample(unix_secs: i64) -> SecondSample {
     SecondSample {
         unix_secs,
@@ -389,19 +474,21 @@ fn empty_sample(unix_secs: i64) -> SecondSample {
     }
 }
 
+/// Returns the current Unix time in seconds, or `0` when the clock is before
+/// the epoch.
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
+/// Returns the index of the bucket that holds a latency of `ns` nanoseconds.
 fn bucket_of(ns: u64) -> usize {
     let value = ns.clamp(1, MAX_LATENCY_NS);
     if value < SUB {
         return value as usize;
     }
-    let log = 63 - value.leading_zeros();
+    let log = value.ilog2();
     let shift = log.saturating_sub(SUB_BITS);
     let significant = (value >> shift) as usize;
     let index = SUB as usize
@@ -410,6 +497,7 @@ fn bucket_of(ns: u64) -> usize {
     index.min(BUCKETS - 1)
 }
 
+/// Returns the largest latency in nanoseconds that falls into bucket `index`.
 fn bucket_upper_ns(index: usize) -> u64 {
     if index < SUB as usize {
         return index as u64;
@@ -421,11 +509,12 @@ fn bucket_upper_ns(index: usize) -> u64 {
     let high = significant
         .saturating_add(1)
         .checked_shl(shift)
-        .map(|value| value.saturating_sub(1))
-        .unwrap_or(u64::MAX);
+        .map_or(u64::MAX, |value| value.saturating_sub(1));
     high.min(MAX_LATENCY_NS)
 }
 
+/// Returns the `(4xx, 5xx)` shares of `requests`, or `None` for both when there
+/// are no requests.
 pub(crate) fn window_rates(status: &[u64; 5], requests: u64) -> (Option<f64>, Option<f64>) {
     if requests == 0 {
         return (None, None);

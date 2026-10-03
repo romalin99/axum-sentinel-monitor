@@ -20,15 +20,13 @@ pub(crate) fn render(config: &Config) -> String {
     } else {
         config.favicon_url.as_str()
     };
-    let descriptor = if cfg!(windows) { "Handles" } else { "FDs" };
-
     DASHBOARD
         .replace("__MONITOR_TITLE__", &escape_html(&config.title))
         .replace("__MONITOR_DESCRIPTION__", &escape_html(&config.description))
         .replace("__MONITOR_FOOTER__", &escape_html(&config.footer))
         .replace("__MONITOR_FAVICON_URL__", &escape_attr(favicon))
         .replace("__MONITOR_REFRESH_MS__", &refresh_ms)
-        .replace("__MONITOR_DESCRIPTOR_LABEL__", descriptor)
+        .replace("__MONITOR_DESCRIPTOR_LABEL__", "FDs")
         .replace("__MONITOR_PID__", &std::process::id().to_string())
 }
 

@@ -213,12 +213,10 @@ impl Collector {
             None => errors.push("system.disk".into()),
         }
 
-        if !cfg!(windows) {
-            let load = System::load_average();
-            stats.load1 = Some(load.one);
-            stats.load5 = Some(load.five);
-            stats.load15 = Some(load.fifteen);
-        }
+        let load = System::load_average();
+        stats.load1 = Some(load.one);
+        stats.load5 = Some(load.five);
+        stats.load15 = Some(load.fifteen);
 
         self.networks.refresh(true);
         let received: u64 = self
@@ -647,23 +645,8 @@ fn open_descriptors() -> Option<i32> {
     std::fs::read_dir(path).ok().map(iter_count_saturating)
 }
 
-/// Counts the open handles of this process.
-#[cfg(windows)]
-fn open_descriptors() -> Option<i32> {
-    use std::os::raw::{c_int, c_void};
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> *mut c_void;
-        fn GetProcessHandleCount(process: *mut c_void, count: *mut u32) -> c_int;
-    }
-    let mut count = 0u32;
-    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that is always valid,
-    // and `count` is a live `u32` the call writes through.
-    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
-    if ok != 0 { Some(count as i32) } else { None }
-}
-
 /// Returns `None`: this platform has no descriptor listing.
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn open_descriptors() -> Option<i32> {
     None
 }

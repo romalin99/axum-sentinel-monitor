@@ -23,7 +23,7 @@ background collection loop, or replace Prometheus, OpenTelemetry, or an APM.
 
 ## Features
 
-- Process CPU, RSS, threads, file descriptors/handles, and uptime
+- Process CPU, RSS, threads, file descriptors, and uptime
 - Tokio live tasks, worker count, and allocator heap details
 - System CPU, memory, application-filesystem usage, load averages, and network rates
 - HTTP requests, in-flight, 1xx–5xx classes, and in-process QPS / P50 / P95 / P99 / P999
@@ -35,6 +35,9 @@ background collection loop, or replace Prometheus, OpenTelemetry, or an APM.
 - SIMD-accelerated JSON extraction and serialization through `sonic-rs`
 
 ## Usage
+
+Linux and macOS on the current stable Rust toolchain are supported; Windows is
+not.
 
 ```toml
 [dependencies]
@@ -106,7 +109,7 @@ requests are not included in HTTP metrics.
 
 | Group | Metrics |
 | --- | --- |
-| Process | CPU, RSS, threads, file descriptors/handles, runtime since monitor initialization |
+| Process | CPU, RSS, threads, file descriptors, runtime since monitor initialization |
 | Runtime | Tokio live tasks (`goroutines`), heap allocation/system/in-use/idle/released memory, worker count (`workers`) |
 | System | CPU, used/available/total memory, application-filesystem usage/type/free space, 1/5/15-minute load averages, aggregate network rates |
 | HTTP | Lifetime request/status totals, in-flight, 30s/60s/90s QPS, 4xx/5xx rates, P50/P95/P99/P999, a 90-point 1s series, and per-route windows |

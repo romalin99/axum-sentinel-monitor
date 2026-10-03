@@ -39,8 +39,7 @@ pub struct ProcessStats {
     pub rss_bytes: Option<u64>,
     /// OS thread count, or `None` when the platform does not report it.
     pub threads: Option<i32>,
-    /// Open file descriptors (handles on Windows), or `None` when the platform
-    /// does not report them.
+    /// Open file descriptors, or `None` when the platform does not report them.
     pub open_descriptors: Option<i32>,
     /// Seconds elapsed since the monitor was created.
     pub uptime_seconds: u64,
@@ -104,11 +103,12 @@ pub struct SystemStats {
     pub disk_free_bytes: Option<u64>,
     /// File-system name of that disk, or `None` when it is unknown.
     pub disk_fstype: Option<String>,
-    /// One-minute load average, or `None` on Windows.
+    /// One-minute load average, or `None` when the platform does not report it.
     pub load1: Option<f64>,
-    /// Five-minute load average, or `None` on Windows.
+    /// Five-minute load average, or `None` when the platform does not report it.
     pub load5: Option<f64>,
-    /// Fifteen-minute load average, or `None` on Windows.
+    /// Fifteen-minute load average, or `None` when the platform does not report
+    /// it.
     pub load15: Option<f64>,
     /// Bytes received per second across all interfaces, or `None` on the first
     /// collection and after a counter reset.

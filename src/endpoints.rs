@@ -117,12 +117,11 @@ impl FxHasher {
 
 impl Hasher for FxHasher {
     fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            // The chunk is exactly eight bytes, so the conversion cannot fail.
-            self.add(u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])));
+        let (words, remainder) = bytes.as_chunks::<8>();
+        for word in words {
+            self.add(u64::from_le_bytes(*word));
         }
-        for &byte in chunks.remainder() {
+        for &byte in remainder {
             self.add(u64::from(byte));
         }
     }

@@ -3,11 +3,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
 use crate::histogram::{SlidingWindow, WINDOW_SECS, WindowAgg};
+use crate::shard::{MAX_STAGES, gauge_line};
 
 /// Upper bound on tracked routes.
 ///
@@ -25,6 +26,13 @@ const MAX_SEGMENT_CHARS: usize = 48;
 
 /// Upper bound in characters on a method name; longer names are truncated.
 const MAX_METHOD_CHARS: usize = 16;
+
+/// Upper bound on entries of a thread's route cache; the cache is emptied when
+/// an insertion would exceed it.
+///
+/// Together with the clear on every eviction this keeps a thread from holding
+/// more than a few hundred keys, whatever the cardinality of the paths it sees.
+const LOCAL_CACHE_LIMIT: usize = 256;
 
 /// Route table key: `"<METHOD> <normalized path>"` in one string.
 ///
@@ -47,22 +55,29 @@ type RouteMap = HashMap<RouteKey, Arc<RouteMetrics>, BuildHasherDefault<FxHasher
 static NEXT_SET_ID: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
-    /// Per-thread scratch buffer and route cache.
+    /// Per-thread scratch buffers and route cache.
     static LOCAL: RefCell<LocalRoutes> = RefCell::new(LocalRoutes::new());
 }
 
-/// Per-thread lookup state: the buffer lookup keys are built in, plus a cache of
-/// the rows this thread resolved recently.
+/// Per-thread lookup state: the buffers lookup keys are built in, plus a cache
+/// of the rows this thread resolved recently.
 ///
 /// The cache turns the hot path of a known route into a hash lookup without the
 /// shared read lock. It mirrors the table of one [`EndpointSet`] and is cleared
 /// whenever the set's generation changes, that is, whenever a row was evicted,
-/// so a stale row is used at most until the thread's next lookup. The rows it
-/// holds stay allocated until then, even after their set is dropped; that is at
-/// most [`MAX_ENDPOINTS`] rows of one set per thread.
+/// so a stale row is used at most until the thread's next lookup; it is also
+/// cleared when it reaches [`LOCAL_CACHE_LIMIT`] entries. The rows it holds stay
+/// allocated until then, even after their set is dropped.
+///
+/// A request that carries the route template Axum matched is cached under the
+/// raw `"<METHOD> <template>"` string, so a hit skips path normalization; the
+/// template space is bounded by the router's routes. Other requests are cached
+/// under their normalized key.
 struct LocalRoutes {
     /// Scratch buffer in which lookup keys are built.
     key: String,
+    /// Scratch buffer in which the normalized key is built on a cache miss.
+    normalized: String,
     /// Identifier of the [`EndpointSet`] the cache mirrors.
     set_id: u64,
     /// Generation of that set when the cache was last cleared.
@@ -76,6 +91,7 @@ impl LocalRoutes {
     fn new() -> Self {
         Self {
             key: String::with_capacity(MAX_PATH_CHARS + MAX_METHOD_CHARS + 8),
+            normalized: String::with_capacity(MAX_PATH_CHARS + MAX_METHOD_CHARS + 8),
             set_id: u64::MAX,
             generation: 0,
             cache: RouteMap::default(),
@@ -148,37 +164,88 @@ fn split_key(key: &str) -> (&str, &str) {
     key.split_once(KEY_SEPARATOR).unwrap_or((key, "/"))
 }
 
-/// Metrics of one tracked route.
+/// Gauges of one route written by the threads mapped to one line.
 ///
-/// The layout is fixed so the three gauges share one cache line with the `Arc`
-/// reference counts in front of them: a request then touches a single line of
-/// this row on the way in and out, and the 100 KiB ring stays untouched until
-/// the request completes.
-#[repr(C)]
-struct RouteMetrics {
-    /// Requests of this route currently being handled.
-    in_flight: AtomicU64,
-    /// Nanoseconds since the table's origin at the last lookup; orders rows for
-    /// LRU eviction.
-    last_used: AtomicU64,
-    /// Tick of the most recent request, biased by one so `0` means "never".
+/// Each thread writes the line of its own index, so a request touches no gauge
+/// line another core writes; the row's values are sums or maxima over the lines.
+#[repr(align(64))]
+struct RouteGauge {
+    /// Requests started minus requests finished on this line.
     ///
-    /// Lets eviction test the 90s window with a single load instead of walking
-    /// all [`WINDOW_SECS`] slots of the route's histogram.
+    /// Signed because a request may start on one line and finish on another
+    /// when its task migrates between worker threads; only the sum over all
+    /// lines is meaningful.
+    in_flight: AtomicI64,
+    /// Nanoseconds since the table's origin at the last lookup on this line;
+    /// the maximum over the lines orders rows for LRU eviction.
+    last_used: AtomicU64,
+    /// Tick of the most recent request on this line, biased by one so `0`
+    /// means "never".
+    ///
+    /// Lets eviction test the 90s window with one load per line instead of
+    /// walking all [`WINDOW_SECS`] slots of the route's histogram.
     last_observe: AtomicU64,
+}
+
+impl RouteGauge {
+    /// Creates a zeroed gauge line.
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicI64::new(0),
+            last_used: AtomicU64::new(0),
+            last_observe: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Metrics of one tracked route.
+struct RouteMetrics {
     /// Completed requests of this route over the trailing window.
     window: SlidingWindow,
+    /// One gauge line per thread index.
+    gauges: Box<[RouteGauge; MAX_STAGES]>,
 }
 
 impl RouteMetrics {
-    /// Marks this row as used at `stamp` nanoseconds since the table's origin.
-    fn touch(&self, stamp: u64) {
-        self.last_used.store(stamp, Ordering::Relaxed);
+    /// Marks this row as used at `stamp` nanoseconds since the table's origin on
+    /// the line of thread `thread`.
+    fn touch(&self, thread: Option<usize>, stamp: u64) {
+        self.gauges[gauge_line(thread)]
+            .last_used
+            .store(stamp, Ordering::Relaxed);
+    }
+
+    /// Returns the requests currently being handled, summed over the lines.
+    ///
+    /// Starts and finishes of one request may be read from different lines at
+    /// different moments, so the sum can briefly dip below zero.
+    fn in_flight(&self) -> u64 {
+        let total: i64 = self
+            .gauges
+            .iter()
+            .map(|gauge| gauge.in_flight.load(Ordering::Relaxed))
+            .sum();
+        u64::try_from(total).unwrap_or(0)
+    }
+
+    /// Returns the LRU stamp of the most recent lookup on any line.
+    fn last_used(&self) -> u64 {
+        self.gauges
+            .iter()
+            .map(|gauge| gauge.last_used.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Returns `true` when no request completed inside the window ending at `tick`.
     fn is_cold(&self, tick: u64) -> bool {
-        match self.last_observe.load(Ordering::Relaxed) {
+        let last_observe = self
+            .gauges
+            .iter()
+            .map(|gauge| gauge.last_observe.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0);
+        match last_observe {
             0 => true,
             stamp => tick.saturating_sub(stamp - 1) >= WINDOW_SECS,
         }
@@ -192,9 +259,11 @@ impl RouteMetrics {
 pub(crate) struct RouteHandle(Arc<RouteMetrics>);
 
 impl RouteHandle {
-    /// Decrements the route's in-flight gauge, saturating at zero.
-    pub(crate) fn end(&self) {
-        saturating_dec(&self.0.in_flight);
+    /// Counts the request as finished on the line of thread `thread`.
+    pub(crate) fn end(&self, thread: Option<usize>) {
+        self.0.gauges[gauge_line(thread)]
+            .in_flight
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -241,36 +310,50 @@ impl EndpointSet {
         }
     }
 
-    /// Resolves the route of a request starting at `now` and counts it as in
-    /// flight.
-    pub(crate) fn begin(&self, method: &str, path: &str, now: Instant) -> RouteHandle {
-        let metrics = self.route_metrics(method, path, now);
-        metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+    /// Resolves the route of a request starting at `now` on thread `thread` and
+    /// counts it as in flight.
+    ///
+    /// `matched` says whether `path` is the route template Axum matched rather
+    /// than the request path.
+    pub(crate) fn begin(
+        &self,
+        method: &str,
+        path: &str,
+        matched: bool,
+        thread: Option<usize>,
+        now: Instant,
+    ) -> RouteHandle {
+        let metrics = self.route_metrics(method, path, matched, thread, now);
+        metrics.gauges[gauge_line(thread)]
+            .in_flight
+            .fetch_add(1, Ordering::Relaxed);
         RouteHandle(metrics)
     }
 
-    /// Records a completed request of `route` in the slot of `tick`.
+    /// Records a completed request of `route` in the second `tick` on behalf of
+    /// thread `thread`.
     pub(crate) fn observe(
         &self,
         route: &RouteHandle,
+        thread: Option<usize>,
         tick: u64,
         bucket: usize,
         class: Option<usize>,
     ) {
-        route
-            .0
+        route.0.gauges[gauge_line(thread)]
             .last_observe
             .store(tick.saturating_add(1), Ordering::Relaxed);
-        route.0.window.record(tick, bucket, class);
+        route.0.window.record(thread, tick, bucket, class);
     }
 
     /// Records a completed request for `method` and `path` at the current tick.
     #[cfg(test)]
     fn observe_path(&self, method: &str, path: &str, ns: u64, status_class: u8) {
         let now = Instant::now();
-        let route = RouteHandle(self.route_metrics(method, path, now));
+        let thread = crate::shard::thread_index();
+        let route = RouteHandle(self.route_metrics(method, path, false, thread, now));
         let (bucket, class) = crate::histogram::sample_of(ns, status_class);
-        self.observe(&route, self.tick_at(now), bucket, class);
+        self.observe(&route, thread, self.tick_at(now), bucket, class);
     }
 
     /// Returns the current tick: whole seconds since `origin`.
@@ -314,7 +397,7 @@ impl EndpointSet {
                 EndpointTraffic {
                     method,
                     path,
-                    in_flight: metrics.in_flight.load(Ordering::Relaxed),
+                    in_flight: metrics.in_flight(),
                     window_30,
                     window_60,
                     window_90,
@@ -338,46 +421,73 @@ impl EndpointSet {
     /// A known route costs one hash lookup in the per-thread cache and no shared
     /// lock. The fallback without thread-local storage only runs while the
     /// thread is shutting down.
-    fn route_metrics(&self, method: &str, path: &str, now: Instant) -> Arc<RouteMetrics> {
+    fn route_metrics(
+        &self,
+        method: &str,
+        path: &str,
+        matched: bool,
+        thread: Option<usize>,
+        now: Instant,
+    ) -> Arc<RouteMetrics> {
         let stamp = self.stamp_at(now);
         let cached = LOCAL.try_with(|local| {
             let mut local = local.borrow_mut();
             let local = &mut *local;
-            local.key.clear();
-            write_key(&mut local.key, method, path);
             local.sync(self);
+            local.key.clear();
+            let raw = write_lookup_key(&mut local.key, method, path, matched);
             if let Some(existing) = local.cache.get(local.key.as_str()) {
-                existing.touch(stamp);
+                existing.touch(thread, stamp);
                 return Arc::clone(existing);
             }
-            let metrics = self.shared_route(&local.key, stamp);
-            local.cache.insert(local.key.clone(), Arc::clone(&metrics));
+            let normalized = if raw {
+                local.normalized.clear();
+                write_key(&mut local.normalized, method, path);
+                local.normalized.as_str()
+            } else {
+                local.key.as_str()
+            };
+            let (metrics, cacheable) = self.shared_route(normalized, thread, stamp);
+            if cacheable {
+                if local.cache.len() >= LOCAL_CACHE_LIMIT {
+                    local.cache.clear();
+                }
+                local.cache.insert(local.key.clone(), Arc::clone(&metrics));
+            }
             metrics
         });
         cached.unwrap_or_else(|_| {
             let mut key = String::new();
             write_key(&mut key, method, path);
-            self.shared_route(&key, stamp)
+            self.shared_route(&key, thread, stamp).0
         })
     }
 
-    /// Returns the row of `key` from the shared table, inserting it when absent.
+    /// Returns the row of `key` from the shared table, inserting it when absent,
+    /// and whether the row is the one `key` names.
     ///
     /// A full table evicts one idle row; when every row is in flight the request
-    /// is attributed to the shared `* /...` overflow row instead.
-    fn shared_route(&self, key: &str, stamp: u64) -> Arc<RouteMetrics> {
+    /// is attributed to the shared `* /...` overflow row instead, which must not
+    /// be cached under `key`: the next lookup should try again for a row of its
+    /// own.
+    fn shared_route(
+        &self,
+        key: &str,
+        thread: Option<usize>,
+        stamp: u64,
+    ) -> (Arc<RouteMetrics>, bool) {
         {
             let routes = self.routes.read().unwrap_or_else(PoisonError::into_inner);
             if let Some(existing) = routes.get(key) {
-                existing.touch(stamp);
-                return Arc::clone(existing);
+                existing.touch(thread, stamp);
+                return (Arc::clone(existing), true);
             }
         }
         let mut routes = self.routes.write().unwrap_or_else(PoisonError::into_inner);
         // Re-check: another thread may have inserted the row between the two locks.
         if let Some(existing) = routes.get(key) {
-            existing.touch(stamp);
-            return Arc::clone(existing);
+            existing.touch(thread, stamp);
+            return (Arc::clone(existing), true);
         }
         if routes.len() >= MAX_ENDPOINTS {
             if evict_one(&mut routes, self.tick()) {
@@ -392,23 +502,21 @@ impl EndpointSet {
                     routes.insert(OVERFLOW_KEY.to_owned(), Arc::clone(&created));
                     created
                 };
-                metrics.touch(stamp);
-                return metrics;
+                metrics.touch(thread, stamp);
+                return (metrics, false);
             }
         }
         let created = self.new_metrics();
-        created.touch(stamp);
+        created.touch(thread, stamp);
         routes.insert(key.to_owned(), Arc::clone(&created));
-        created
+        (created, true)
     }
 
     /// Creates an empty row on this table's time base.
     fn new_metrics(&self) -> Arc<RouteMetrics> {
         Arc::new(RouteMetrics {
-            in_flight: AtomicU64::new(0),
-            last_used: AtomicU64::new(0),
-            last_observe: AtomicU64::new(0),
             window: SlidingWindow::with_clock(self.origin, Arc::clone(&self.extra_secs)),
+            gauges: Box::new(std::array::from_fn(|_| RouteGauge::new())),
         })
     }
 }
@@ -422,10 +530,10 @@ fn evict_one(routes: &mut RouteMap, tick: u64) -> bool {
     let mut cold: Option<(&RouteKey, u64)> = None;
     let mut warm: Option<(&RouteKey, u64)> = None;
     for (key, metrics) in routes.iter() {
-        if metrics.in_flight.load(Ordering::Relaxed) != 0 {
+        if metrics.in_flight() != 0 {
             continue;
         }
-        let last_used = metrics.last_used.load(Ordering::Relaxed);
+        let last_used = metrics.last_used();
         let group = if metrics.is_cold(tick) {
             &mut cold
         } else {
@@ -443,16 +551,22 @@ fn evict_one(routes: &mut RouteMap, tick: u64) -> bool {
     true
 }
 
-/// Decrements `value` unless it is already zero.
+/// Appends the cache lookup key of a request to `out` and returns whether it is
+/// the raw `"<METHOD> <template>"` form rather than the normalized key.
 ///
-/// The decrement is unconditional and undone when it underflowed: one atomic
-/// instead of a load plus compare-and-swap on the common path. The underflow
-/// only happens on a double release, which the guards never do, so the wrapped
-/// value is never observed in practice.
-pub(crate) fn saturating_dec(value: &AtomicU64) {
-    if value.fetch_sub(1, Ordering::Relaxed) == 0 {
-        value.fetch_add(1, Ordering::Relaxed);
+/// The raw form is used only for a matched route template with a plain
+/// upper-case method and a bounded length: the template space is then bounded
+/// by the router's routes, and the method needs no folding, so the raw key
+/// names the same route as the normalized one.
+fn write_lookup_key(out: &mut String, method: &str, path: &str, matched: bool) -> bool {
+    if matched && is_plain_method(method) && path.len() <= MAX_PATH_CHARS {
+        out.push_str(method);
+        out.push(KEY_SEPARATOR);
+        out.push_str(path);
+        return true;
     }
+    write_key(out, method, path);
+    false
 }
 
 /// Appends the [`RouteKey`] of `method` and `path` to `out`.
@@ -460,6 +574,14 @@ fn write_key(out: &mut String, method: &str, path: &str) {
     write_normalized_method(out, method);
     out.push(KEY_SEPARATOR);
     write_normalized_path(out, path);
+}
+
+/// Returns `true` when `method` is already in canonical form: non-empty,
+/// upper-case ASCII, and at most [`MAX_METHOD_CHARS`] long.
+fn is_plain_method(method: &str) -> bool {
+    !method.is_empty()
+        && method.len() <= MAX_METHOD_CHARS
+        && method.bytes().all(|byte| byte.is_ascii_uppercase())
 }
 
 /// Returns the canonical form of `method` as an owned string.
@@ -474,10 +596,7 @@ fn normalize_method(method: &str) -> String {
 fn write_normalized_method(out: &mut String, method: &str) {
     // Nearly every request carries a standard upper-case method, which needs
     // neither trimming nor case folding.
-    if !method.is_empty()
-        && method.len() <= MAX_METHOD_CHARS
-        && method.bytes().all(|byte| byte.is_ascii_uppercase())
-    {
+    if is_plain_method(method) {
         out.push_str(method);
         return;
     }
@@ -592,7 +711,26 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use crate::shard::thread_index;
+
     use super::*;
+
+    /// Creates a table on a fresh time base.
+    fn new_set() -> EndpointSet {
+        EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Returns the number of entries this thread's cache holds for `set`.
+    fn local_cache_len(set: &EndpointSet) -> usize {
+        LOCAL.with(|local| {
+            let local = local.borrow();
+            if local.set_id == set.id {
+                local.cache.len()
+            } else {
+                0
+            }
+        })
+    }
 
     #[test]
     fn collapses_ids_and_keeps_named_segments() {
@@ -628,8 +766,62 @@ mod tests {
     }
 
     #[test]
+    fn matched_templates_are_cached_raw_and_reported_normalized() {
+        let set = new_set();
+        let thread = thread_index();
+        let first = set.begin("GET", "/items/{id}", true, thread, Instant::now());
+        let second = set.begin("GET", "/items/{id}", true, thread, Instant::now());
+        // Both lookups resolve to one row, and the raw template is what the
+        // thread cache holds.
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        assert!(LOCAL.with(|local| local.borrow().cache.contains_key("GET /items/{id}")));
+        // A request without a template for the same route shares the row.
+        let third = set.begin("GET", "/items/42", false, thread, Instant::now());
+        assert!(Arc::ptr_eq(&first.0, &third.0));
+        first.end(thread);
+        second.end(thread);
+        third.end(thread);
+
+        let rows = set.snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/items/:id");
+        assert_eq!(rows[0].in_flight, 0);
+    }
+
+    #[test]
+    fn unusual_methods_and_long_templates_skip_the_raw_cache() {
+        let set = new_set();
+        let thread = thread_index();
+        let long = format!("/{}", "a".repeat(MAX_PATH_CHARS + 1));
+        set.begin("get", "/items/{id}", true, thread, Instant::now())
+            .end(thread);
+        set.begin("GET", &long, true, thread, Instant::now())
+            .end(thread);
+        LOCAL.with(|local| {
+            let local = local.borrow();
+            assert!(local.cache.contains_key("GET /items/:id"));
+            assert!(
+                local
+                    .cache
+                    .keys()
+                    .all(|key| key.len() <= MAX_PATH_CHARS + MAX_METHOD_CHARS + 1)
+            );
+        });
+    }
+
+    #[test]
+    fn thread_cache_stays_bounded_under_high_cardinality_paths() {
+        let set = new_set();
+        for index in 0..(LOCAL_CACHE_LIMIT * 10) {
+            set.observe_path("GET", &format!("/user/name-{index}"), 1_000_000, 2);
+            assert!(local_cache_len(&set) <= LOCAL_CACHE_LIMIT);
+        }
+        assert_eq!(set.snapshot().len(), MAX_ENDPOINTS);
+    }
+
+    #[test]
     fn sorts_busiest_endpoint_first() {
-        let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
+        let set = new_set();
         set.observe_path("GET", "/work", 1_000_000, 2);
         set.observe_path("GET", "/work", 1_000_000, 2);
         set.observe_path("GET", "/slow", 8_000_000, 2);
@@ -650,20 +842,21 @@ mod tests {
 
     #[test]
     fn tracks_in_flight_ahead_of_completed_traffic() {
-        let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
+        let set = new_set();
+        let thread = thread_index();
         set.observe_path("GET", "/work", 1_000_000, 2);
         set.observe_path("GET", "/work", 1_000_000, 2);
-        let first = set.begin("GET", "/hold", Instant::now());
-        let second = set.begin("GET", "/hold", Instant::now());
+        let first = set.begin("GET", "/hold", false, thread, Instant::now());
+        let second = set.begin("GET", "/hold", false, thread, Instant::now());
         let rows = set.snapshot();
         assert_eq!(rows[0].path, "/hold");
         assert_eq!(rows[0].in_flight, 2);
         assert_eq!(rows[0].window_60.requests, 0);
         assert_eq!(rows[1].path, "/work");
         assert_eq!(rows[1].window_60.requests, 2);
-        first.end();
+        first.end(thread);
         assert_eq!(set.snapshot()[0].in_flight, 1);
-        second.end();
+        second.end(thread);
         let idle = set.snapshot();
         assert_eq!(
             idle.iter()
@@ -673,6 +866,28 @@ mod tests {
             0
         );
         assert_eq!(idle[0].path, "/work");
+    }
+
+    #[test]
+    fn in_flight_survives_finishing_on_another_thread() {
+        let set = Arc::new(new_set());
+        let handle = set.begin("GET", "/migrate", false, thread_index(), Instant::now());
+        assert_eq!(set.snapshot()[0].in_flight, 1);
+        let ended = {
+            let set = Arc::clone(&set);
+            std::thread::spawn(move || {
+                handle.end(thread_index());
+                set.snapshot()[0].in_flight
+            })
+            .join()
+            .unwrap()
+        };
+        assert_eq!(ended, 0);
+        // The lines now hold +1 and -1; a new request still reads as one in flight.
+        let again = set.begin("GET", "/migrate", false, thread_index(), Instant::now());
+        assert_eq!(set.snapshot()[0].in_flight, 1);
+        again.end(thread_index());
+        assert_eq!(set.snapshot()[0].in_flight, 0);
     }
 
     #[test]
@@ -696,7 +911,7 @@ mod tests {
 
     #[test]
     fn evicts_least_recently_used_when_full() {
-        let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
+        let set = new_set();
         for index in 0..MAX_ENDPOINTS {
             set.observe_path("GET", &format!("/route-{index}"), 1_000_000, 2);
         }
@@ -716,7 +931,7 @@ mod tests {
 
     #[test]
     fn evicted_row_leaves_the_thread_cache() {
-        let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
+        let set = new_set();
         for index in 0..MAX_ENDPOINTS {
             set.observe_path("GET", &format!("/route-{index}"), 1_000_000, 2);
         }
@@ -735,8 +950,9 @@ mod tests {
 
     #[test]
     fn never_evicts_rows_with_in_flight_requests() {
-        let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
-        let hold = set.begin("GET", "/hold", Instant::now());
+        let set = new_set();
+        let thread = thread_index();
+        let hold = set.begin("GET", "/hold", false, thread, Instant::now());
         for index in 0..(MAX_ENDPOINTS * 2) {
             set.observe_path("GET", &format!("/route-{index}"), 1_000_000, 2);
         }
@@ -749,7 +965,7 @@ mod tests {
             .expect("in-flight row survives eviction");
         assert_eq!(row.in_flight, 1);
 
-        hold.end();
+        hold.end(thread);
         let idle = set.snapshot();
         assert_eq!(
             idle.iter()
@@ -762,11 +978,20 @@ mod tests {
 
     #[test]
     fn falls_back_to_overflow_when_every_row_is_in_flight() {
-        let set = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
+        let set = new_set();
+        let thread = thread_index();
         for index in 0..MAX_ENDPOINTS {
-            let _held = set.begin("GET", &format!("/hold-{index}"), Instant::now());
+            let _held = set.begin(
+                "GET",
+                &format!("/hold-{index}"),
+                false,
+                thread,
+                Instant::now(),
+            );
         }
-        let extra = set.begin("GET", "/extra", Instant::now());
+        let extra = set.begin("GET", "/extra", false, thread, Instant::now());
+        // The overflow row is never cached under the key it absorbed.
+        assert!(!LOCAL.with(|local| local.borrow().cache.contains_key("GET /extra")));
 
         let rows = set.snapshot();
         let overflow = rows
@@ -775,7 +1000,7 @@ mod tests {
             .expect("overflow row when nothing is evictable");
         assert_eq!(overflow.in_flight, 1);
 
-        extra.end();
+        extra.end(thread);
         let drained = set.snapshot();
         assert_eq!(
             drained
@@ -791,6 +1016,7 @@ mod tests {
     fn evicts_rows_without_recent_traffic_before_the_lru_row() {
         let extra = Arc::new(AtomicU64::new(0));
         let set = EndpointSet::with_clock(Instant::now(), Arc::clone(&extra));
+        let thread = thread_index();
         set.observe_path("GET", "/stale", 1_000_000, 2);
         extra.fetch_add(91, Ordering::Relaxed);
         for index in 0..(MAX_ENDPOINTS - 1) {
@@ -800,7 +1026,8 @@ mod tests {
 
         // `begin`/`end` refresh the LRU position without recording a request, so
         // `/stale` is now the most recently used row yet still has an empty window.
-        set.begin("GET", "/stale", Instant::now()).end();
+        set.begin("GET", "/stale", false, thread, Instant::now())
+            .end(thread);
         set.observe_path("GET", "/fresh", 1_000_000, 2);
 
         let paths: Vec<String> = set.snapshot().into_iter().map(|row| row.path).collect();
@@ -813,22 +1040,33 @@ mod tests {
 
     #[test]
     fn separate_sets_do_not_share_the_thread_cache() {
-        let first = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
-        let second = EndpointSet::with_clock(Instant::now(), Arc::new(AtomicU64::new(0)));
+        let first = new_set();
+        let second = new_set();
+        let thread = thread_index();
         first.observe_path("GET", "/shared", 1_000_000, 2);
         second.observe_path("GET", "/shared", 1_000_000, 2);
         first.observe_path("GET", "/shared", 1_000_000, 2);
         assert_eq!(first.snapshot()[0].window_90.requests, 2);
         assert_eq!(second.snapshot()[0].window_90.requests, 1);
+
+        // The same holds for raw template keys.
+        first
+            .begin("GET", "/t/{id}", true, thread, Instant::now())
+            .end(thread);
+        second
+            .begin("GET", "/t/{id}", true, thread, Instant::now())
+            .end(thread);
+        first
+            .begin("GET", "/t/{id}", true, thread, Instant::now())
+            .end(thread);
+        assert_eq!(first.snapshot().len(), 2);
+        assert_eq!(second.snapshot().len(), 2);
     }
 
     #[test]
     fn concurrent_registration_creates_one_route() {
         const THREADS: usize = 16;
-        let set = Arc::new(EndpointSet::with_clock(
-            Instant::now(),
-            Arc::new(AtomicU64::new(0)),
-        ));
+        let set = Arc::new(new_set());
         let barrier = Arc::new(std::sync::Barrier::new(THREADS));
         let threads: Vec<_> = (0..THREADS)
             .map(|_| {
@@ -836,7 +1074,9 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    set.begin("GET", "/shared", Instant::now()).end();
+                    let thread = thread_index();
+                    set.begin("GET", "/shared", false, thread, Instant::now())
+                        .end(thread);
                 })
             })
             .collect();

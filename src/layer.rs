@@ -102,11 +102,11 @@ where
         let started = Instant::now();
         let route = {
             let method = request.method().as_str();
-            let path = request
-                .extensions()
-                .get::<MatchedPath>()
-                .map_or_else(|| request.uri().path(), MatchedPath::as_str);
-            stats.http().begin_request(method, path, started)
+            let (path, matched) = match request.extensions().get::<MatchedPath>() {
+                Some(matched) => (matched.as_str(), true),
+                None => (request.uri().path(), false),
+            };
+            stats.http().begin_request(method, path, matched, started)
         };
         let inner = self.inner.call(request);
         MonitorFuture {

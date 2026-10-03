@@ -10,6 +10,24 @@
 //! window are evicted first and the least recently used row goes first within
 //! that group, while rows with in-flight requests are never evicted.
 //!
+//! # Recording cost
+//!
+//! Recording is lock-free. Each of the first 64 threads that record owns a
+//! stage in every ring and a gauge line in every route, so a request on such a
+//! thread writes only cache lines of its own; a stage holds one second and is
+//! moved into the shared ring when that second ends. Threads beyond the first
+//! 64 record straight into the shared ring, which is exact but contended.
+//! Snapshots read the rings and the stages together and validate every stage
+//! read, so each sample is counted exactly once; a snapshot disturbed by stage
+//! moves on every one of its attempts reports the rings alone, under-reporting
+//! the staged seconds once and never counting a sample twice.
+//!
+//! Memory per ring is 98 KiB plus 1,152 bytes per recording thread; each route
+//! adds a ring and 4 KiB of gauge lines, so a full table of 64 routes with 8
+//! recording threads holds about 7 MiB. Rows are freed when they are evicted,
+//! except that a thread's route cache keeps up to 256 rows alive until that
+//! thread's next lookup after an eviction.
+//!
 //! # Examples
 //!
 //! ```no_run
@@ -35,6 +53,7 @@ mod endpoints;
 mod histogram;
 mod json;
 mod layer;
+mod shard;
 mod snapshot;
 mod stats;
 

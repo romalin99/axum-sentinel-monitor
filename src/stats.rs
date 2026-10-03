@@ -1,7 +1,6 @@
 //! Shared monitor state: live HTTP counters and the cached snapshot.
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -10,30 +9,8 @@ use axum::http::StatusCode;
 use crate::collect::Collector;
 use crate::endpoints::{EndpointSet, RouteHandle};
 use crate::histogram::{SlidingWindow, sample_of};
+use crate::shard::{COUNTER_SHARDS, counter_shard, thread_index};
 use crate::snapshot::Snapshot;
-
-/// Number of shards the global counters are split into.
-///
-/// Every request increments the request counter and the in-flight gauge, so
-/// with a single copy all cores would bounce the same cache line. A thread
-/// writes to the shard it was assigned on first use; snapshots sum the shards.
-const COUNTER_SHARDS: usize = 16;
-
-/// Source of the shard indices handed to threads.
-static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    /// Shard of the global counters this thread writes to.
-    static SHARD: Cell<usize> = {
-        Cell::new(NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % COUNTER_SHARDS)
-    };
-}
-
-/// Returns the shard of the current thread, or shard zero while the thread is
-/// shutting down and its thread-local storage is gone.
-fn current_shard() -> usize {
-    SHARD.try_with(Cell::get).unwrap_or(0)
-}
 
 /// State shared by a [`crate::Monitor`] and its layers: live HTTP counters plus
 /// the snapshot collector and its cache.
@@ -92,6 +69,10 @@ impl CounterShard {
 }
 
 /// Lock-free HTTP counters updated on the request path.
+///
+/// Every request increments the request counter and the in-flight gauge, so
+/// with a single copy all cores would bounce the same cache line. A thread
+/// writes to the shard of its index; snapshots sum the shards.
 pub(crate) struct HttpMetrics {
     /// Lifetime counters, one shard per group of threads.
     shards: [CounterShard; COUNTER_SHARDS],
@@ -192,11 +173,21 @@ impl HttpMetrics {
     }
 
     /// Counts a request that started at `now` and resolves its route slot.
-    pub(crate) fn begin_request(&self, method: &str, path: &str, now: Instant) -> RouteHandle {
-        let shard = &self.shards[current_shard()];
+    ///
+    /// `matched` says whether `path` is the route template Axum matched rather
+    /// than the request path.
+    pub(crate) fn begin_request(
+        &self,
+        method: &str,
+        path: &str,
+        matched: bool,
+        now: Instant,
+    ) -> RouteHandle {
+        let thread = thread_index();
+        let shard = &self.shards[counter_shard(thread)];
         shard.requests.fetch_add(1, Ordering::Relaxed);
         shard.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.endpoints.begin(method, path, now)
+        self.endpoints.begin(method, path, matched, thread, now)
     }
 
     /// Records the status class and latency of a request that started at
@@ -211,13 +202,14 @@ impl HttpMetrics {
         let ns =
             u64::try_from(now.saturating_duration_since(started).as_nanos()).unwrap_or(u64::MAX);
         let (bucket, class) = sample_of(ns, (status.as_u16() / 100) as u8);
+        let thread = thread_index();
         // Classes outside `1xx` to `5xx` have no counter and are ignored.
         if let Some(class) = class {
-            self.shards[current_shard()].status[class].fetch_add(1, Ordering::Relaxed);
+            self.shards[counter_shard(thread)].status[class].fetch_add(1, Ordering::Relaxed);
         }
         let tick = self.latency.tick_at(now);
-        self.latency.record(tick, bucket, class);
-        self.endpoints.observe(route, tick, bucket, class);
+        self.latency.record(thread, tick, bucket, class);
+        self.endpoints.observe(route, thread, tick, bucket, class);
     }
 
     /// Returns the requests started since creation.
@@ -263,10 +255,11 @@ impl HttpMetrics {
 
     /// Decrements the global and per-route in-flight gauges.
     pub(crate) fn end_in_flight(&self, route: &RouteHandle) {
-        self.shards[current_shard()]
+        let thread = thread_index();
+        self.shards[counter_shard(thread)]
             .in_flight
             .fetch_sub(1, Ordering::Relaxed);
-        route.end();
+        route.end(thread);
     }
 }
 
@@ -290,10 +283,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn in_flight_decrement_saturates_at_zero() {
+    fn in_flight_gauges_never_report_below_zero() {
         let stats = SharedStats::new(Duration::from_secs(1), "/monitor");
-        let route = stats.http.begin_request("GET", "/", Instant::now());
+        let route = stats.http.begin_request("GET", "/", false, Instant::now());
         stats.http.end_in_flight(&route);
+        // A double release is a programming error the guards never commit; the
+        // reported gauges still clamp at zero.
         stats.http.end_in_flight(&route);
         assert_eq!(stats.http.in_flight(), 0);
         assert_eq!(stats.http.endpoints().snapshot()[0].in_flight, 0);
@@ -307,7 +302,7 @@ mod tests {
                 let stats = Arc::clone(&stats);
                 std::thread::spawn(move || {
                     let started = Instant::now();
-                    let route = stats.http.begin_request("GET", "/", started);
+                    let route = stats.http.begin_request("GET", "/", false, started);
                     stats
                         .http
                         .finish(&route, started, Instant::now(), StatusCode::OK);

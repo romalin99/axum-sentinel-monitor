@@ -1,4 +1,5 @@
-//! Lock-free sliding-window latency histogram over one-second slots.
+//! Sliding-window latency histogram over one-second slots, kept in atomic
+//! counters.
 //!
 //! Samples are first recorded into a thread-private stage that holds the
 //! current second of one thread; the stage owner moves it into the shared ring
@@ -47,16 +48,18 @@ const PERCENTILES: [u32; 4] = [500, 950, 990, 999];
 /// stage one second older than this is still inside the window and is left
 /// where it is until it expires; the sample that found it bypasses the stage.
 const FLUSH_MAX_AGE: u64 = WINDOW_SECS - 2;
-/// Attempts a fold makes to read the stages consistently.
+/// Attempts a fold makes to read the stages consistently before it stops
+/// waiting for moves to finish.
 ///
 /// A fold yields before its first retries and then sleeps between attempts,
 /// about thirty milliseconds in all, so a thread preempted in the middle of a
-/// stage move gets to finish it even when it is queued on another CPU. A stage
-/// still mid-move on the last attempt is left out of that one snapshot.
+/// stage move gets to finish it even when it is queued on another CPU. After
+/// the last attempt, a stage still mid-move, or moved while the fold read it,
+/// is left out of that one snapshot.
 const MAX_FOLD_ATTEMPTS: usize = 64;
 /// Pause between the fold attempts after the yielding ones.
 const FOLD_SHORT_PAUSE: Duration = Duration::from_micros(50);
-/// Pause between the fold attempts after the tenth.
+/// Pause between the fold attempts once the short pauses are over.
 const FOLD_LONG_PAUSE: Duration = Duration::from_micros(500);
 
 /// Plain (non-atomic) latency histogram used to merge slots while folding.
@@ -129,8 +132,8 @@ impl LatencyHist {
 
 /// Lock-free counters of one second, used both as a ring slot and as a stage.
 ///
-/// Aligned to 128 bytes, which covers every supported CPU's cache line, so a
-/// stage never shares a line with its neighbours.
+/// Aligned to 128 bytes, wider than the cache lines of the CPUs this crate is
+/// tested on, so a stage never shares a line with its neighbours.
 #[repr(align(128))]
 struct Slot {
     /// Second this slot currently holds, or [`TICK_EMPTY`] / [`TICK_RESETTING`].
@@ -252,16 +255,21 @@ fn move_count(src: &AtomicU32, dst: &AtomicU32) {
     }
 }
 
+/// Test hook run after each read of the stages, so a test can move a stage
+/// while a fold is in progress.
+#[cfg(test)]
+type AfterReadHook = Box<dyn FnMut(&SlidingWindow) + Send>;
+
 /// Ring of one-second [`Slot`]s covering the trailing [`WINDOW_SECS`] seconds,
 /// plus one stage per recording thread.
 ///
 /// A tick is the number of whole seconds since `origin`; slot `tick % WINDOW_SECS`
 /// is recycled by the first writer that reaches a newer second. A thread with an
 /// index below [`MAX_STAGES`] records into its own stage, which holds one second,
-/// and moves the stage into the ring slot of that second when it records the
-/// next one. Nothing but that thread writes its stage, so recording touches no
-/// cache line another core writes; threads without a stage record straight into
-/// the ring.
+/// and moves the stage into the ring slot of that second when it records a
+/// later one, except that a second one step from the ring's wrap stays in the
+/// stage until it expires. Nothing but that thread writes its stage; threads
+/// without a stage record straight into the ring.
 pub(crate) struct SlidingWindow {
     /// Instant that tick zero is measured from.
     origin: Instant,
@@ -272,6 +280,10 @@ pub(crate) struct SlidingWindow {
     slots: Box<[Slot]>,
     /// Stage of each thread index, allocated by the thread's first record.
     stages: [OnceLock<Box<Slot>>; MAX_STAGES],
+    /// Test hook run after each read of the stages; `None` outside a test that
+    /// installs one.
+    #[cfg(test)]
+    after_read: std::sync::Mutex<Option<AfterReadHook>>,
 }
 
 /// Traffic aggregated over one trailing window.
@@ -354,6 +366,8 @@ impl SlidingWindow {
             extra_secs,
             slots: (0..WINDOW_SECS).map(|_| Slot::new()).collect(),
             stages: std::array::from_fn(|_| OnceLock::new()),
+            #[cfg(test)]
+            after_read: std::sync::Mutex::new(None),
         }
     }
 
@@ -384,9 +398,10 @@ impl SlidingWindow {
     ///
     /// `bucket` and `class` come from [`sample_of`], computed once by the caller
     /// and shared by the global and the per-route window. The sample goes into
-    /// the thread's stage when it has one and the stage holds `tick` or an older
-    /// second; otherwise it goes straight into the ring, where it is dropped
-    /// when the slot has already moved on to a newer second.
+    /// the thread's stage when it has one and the stage holds `tick`, or an
+    /// older second that can still be moved into the ring; otherwise it goes
+    /// straight into the ring, where it is dropped when the slot has already
+    /// moved on to a newer second.
     pub(crate) fn record(
         &self,
         thread: Option<usize>,
@@ -508,42 +523,68 @@ impl SlidingWindow {
     /// it; a stage that moved meanwhile has pushed samples into the ring that
     /// were also read from the stage, so the whole fold starts over. Threads
     /// move a stage at most once per second, so a retry is rare. A stage caught
-    /// in the middle of a move is retried for as long as [`MAX_FOLD_ATTEMPTS`]
-    /// allows and then left out of this one snapshot, which under-reports that
-    /// thread's staged seconds once; nothing is ever counted twice.
+    /// in the middle of a move is waited for as long as [`MAX_FOLD_ATTEMPTS`]
+    /// allows; after that, every stage that is still moving or that moves while
+    /// the fold reads is left out, which under-reports those threads' staged
+    /// seconds in this one snapshot. Nothing is ever counted twice.
     fn fold(&self, with_series: bool, tick: u64) -> TrafficSnapshot {
         let unix = with_series.then(unix_now);
         let mut staged = Vec::new();
         let mut observed = [TICK_EMPTY; MAX_STAGES];
-        for attempt in 0..MAX_FOLD_ATTEMPTS {
-            if attempt != 0 {
+        let mut skipped = [false; MAX_STAGES];
+        let mut attempt = 0;
+        loop {
+            if attempt != 0 && attempt < MAX_FOLD_ATTEMPTS {
                 back_off(attempt);
             }
-            let stable = self.read_stages(tick, &mut staged, &mut observed);
+            let stable = self.read_stages(tick, &skipped, &mut staged, &mut observed);
+            #[cfg(test)]
+            self.run_after_read_hook();
             let snapshot = Fold::run(self, tick, unix, &staged);
             // Pairs with the release fence of `advance_stage`: a fold that read
             // moved samples out of the ring also sees that stage's tick change.
             fence(Ordering::Acquire);
-            if self.stages_unchanged(&observed) && (stable || attempt + 1 == MAX_FOLD_ATTEMPTS) {
+            let moved = self.moved_stages(&observed);
+            let waiting = attempt + 1 < MAX_FOLD_ATTEMPTS;
+            if !moved.contains(&true) && (stable || !waiting) {
                 return snapshot;
             }
+            if !waiting {
+                // Each further pass leaves out at least one more stage, so this
+                // ends within as many passes as there are stages.
+                for (skip, moved) in skipped.iter_mut().zip(moved) {
+                    *skip |= moved;
+                }
+            }
+            attempt += 1;
         }
-        staged.clear();
-        Fold::run(self, tick, unix, &staged)
+    }
+
+    /// Runs the test hook installed in `after_read`, if any.
+    #[cfg(test)]
+    fn run_after_read_hook(&self) {
+        let mut hook = self
+            .after_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hook) = hook.as_mut() {
+            hook(self);
+        }
     }
 
     /// Reads every stage holding a second of the window ending at `tick` into
     /// `staged`, one entry per distinct second, recording the tick of each stage
-    /// read into `observed`.
+    /// that contributed into `observed`.
     ///
     /// Returns `false` when a stage was being moved and was skipped, so that the
-    /// caller tries again once the move is over. Only stages that contributed
-    /// samples are recorded in `observed`: a stage that was empty, ahead of
-    /// `tick`, or already outside the window cannot move samples into a second
-    /// this fold counts.
+    /// caller tries again once the move is over. Stages flagged in `skipped` are
+    /// never read. Only stages that contributed samples are recorded in
+    /// `observed`: nothing was taken from the others, so whatever they move into
+    /// the ring later is counted there once.
     fn read_stages(
         &self,
         tick: u64,
+        skipped: &[bool; MAX_STAGES],
         staged: &mut Vec<Staged>,
         observed: &mut [u64; MAX_STAGES],
     ) -> bool {
@@ -555,6 +596,9 @@ impl SlidingWindow {
             let Some(stage) = cell.get() else {
                 continue;
             };
+            if skipped[index] {
+                continue;
+            }
             let stage_tick = stage.tick.load(Ordering::Acquire);
             if stage_tick == TICK_EMPTY {
                 continue;
@@ -581,13 +625,15 @@ impl SlidingWindow {
         stable
     }
 
-    /// Returns `true` when no stage recorded in `observed` has moved since.
-    fn stages_unchanged(&self, observed: &[u64; MAX_STAGES]) -> bool {
-        self.stages.iter().zip(observed).all(|(cell, &before)| {
-            before == TICK_EMPTY
-                || cell
+    /// Returns, per stage, whether it moved since `observed` was taken; a stage
+    /// that contributed nothing is never reported as moved.
+    fn moved_stages(&self, observed: &[u64; MAX_STAGES]) -> [bool; MAX_STAGES] {
+        std::array::from_fn(|index| {
+            let before = observed[index];
+            before != TICK_EMPTY
+                && self.stages[index]
                     .get()
-                    .is_some_and(|stage| stage.tick.load(Ordering::Relaxed) == before)
+                    .is_none_or(|stage| stage.tick.load(Ordering::Relaxed) != before)
         })
     }
 
@@ -1020,7 +1066,7 @@ mod tests {
         window.record(Some(0), 10, bucket, class);
         let mut staged = Vec::new();
         let mut observed = [TICK_EMPTY; MAX_STAGES];
-        assert!(window.read_stages(11, &mut staged, &mut observed));
+        assert!(window.read_stages(11, &[false; MAX_STAGES], &mut staged, &mut observed));
         assert_eq!(staged.len(), 1);
 
         // The stage moves after it was read: the ring now holds the two samples
@@ -1029,7 +1075,27 @@ mod tests {
         window.record(Some(0), 11, bucket, class);
         let torn = Fold::run(&window, 11, None, &staged);
         assert_eq!(torn.window_90.requests, 4);
-        assert!(!window.stages_unchanged(&observed));
+        assert!(window.moved_stages(&observed).contains(&true));
+        assert_eq!(window.fold(false, 11).window_90.requests, 3);
+    }
+
+    #[test]
+    fn a_stage_moved_while_a_fold_reads_is_counted_once() {
+        warm_indices(1);
+        let window = SlidingWindow::new();
+        let (bucket, class) = sample_of(1_000_000, 2);
+        window.record(Some(0), 10, bucket, class);
+        window.record(Some(0), 10, bucket, class);
+        // The fold takes two samples from the stage, then the hook moves them
+        // into the ring: only a fold that notices the move and starts over keeps
+        // the count at three.
+        *window
+            .after_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Box::new(move |window: &SlidingWindow| {
+                window.record(Some(0), 11, bucket, class);
+            }));
         assert_eq!(window.fold(false, 11).window_90.requests, 3);
     }
 

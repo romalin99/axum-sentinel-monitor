@@ -78,9 +78,9 @@ thread_local! {
 /// allocated until then, even after their set is dropped.
 ///
 /// A request that carries the route template Axum matched is cached under the
-/// raw `"<METHOD> <template>"` string, so a hit skips path normalization; the
-/// template space is bounded by the router's routes. Other requests are cached
-/// under their normalized key.
+/// raw method and template joined by a NUL byte, so a hit skips path
+/// normalization; the template space is bounded by the router's routes. Other
+/// requests are cached under their normalized key.
 struct LocalRoutes {
     /// Scratch buffer in which lookup keys are built.
     key: String,
@@ -215,17 +215,20 @@ impl RouteGauge {
 /// Bytes that separate the in-flight gauge from the rest of a row.
 ///
 /// Together with the `Arc` counts (16 bytes) and the gauge (8 bytes) they fill
-/// 128 bytes, the widest cache line of a supported CPU, so the fields a request
-/// only reads never share a line with the counts every request writes.
+/// 128 bytes, wider than the cache lines of the CPUs this crate is tested on,
+/// so the fields a request only reads never share a line with the counts every
+/// request writes.
 const ROW_HEADER_PADDING: usize = 128 - 16 - 8;
 
 /// Metrics of one tracked route.
 ///
-/// The layout is fixed so the in-flight gauge shares its cache line with the
-/// `Arc` reference counts in front of it. Every request already writes that line
-/// when it clones and drops its handle, so keeping the gauge there costs no
-/// further cross-core traffic, while keeping it a single counter makes eviction
-/// read an exact value: a row with a request in flight is never evicted.
+/// The layout is fixed so the in-flight gauge directly follows the `Arc`
+/// reference counts. A heap allocation is only 16-byte aligned, so the gauge
+/// shares the counts' cache line for about three rows in four and lies on the
+/// next line otherwise. Every request writes the counts when it clones and
+/// drops its handle, so keeping the gauge next to them adds little cross-core
+/// traffic, while a single counter makes eviction read an exact value: a row
+/// with a request in flight is never evicted.
 #[repr(C)]
 struct RouteMetrics {
     /// Requests of this route currently being handled.
@@ -252,7 +255,7 @@ impl RouteMetrics {
         self.in_flight.load(Ordering::Relaxed)
     }
 
-    /// Returns the stamp lines that a thread has ever written.
+    /// Returns the stamp lines of every thread index handed out so far.
     fn used_gauges(&self) -> &[RouteGauge] {
         &self.gauges[..live_indices()]
     }
@@ -832,7 +835,7 @@ mod tests {
     fn raw_template_keys_never_collide_with_normalized_keys() {
         let set = new_set();
         let thread = thread_index();
-        // A literal route whose only segment is 48 digits normalizes to `:id`,
+        // A literal route whose last segment is 48 digits normalizes to `:id`,
         // while a request path one character longer is cut back to exactly the
         // template text by the segment limit.
         let template = format!("/keys/{}", "1".repeat(MAX_SEGMENT_CHARS));

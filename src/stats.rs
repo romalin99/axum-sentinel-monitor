@@ -41,8 +41,10 @@ struct CacheEntry {
     cached_at: Instant,
 }
 
-/// One shard of the lifetime counters, padded to a cache line of its own
-/// (128 bytes covers every supported CPU) so that threads never share one.
+/// One shard of the lifetime counters, padded to 128 bytes, wider than the
+/// cache lines of the CPUs this crate is tested on, so that threads with
+/// distinct indices never share a line; threads beyond the shard count and
+/// threads without an index share one.
 #[repr(align(128))]
 struct CounterShard {
     /// Requests started since creation.
@@ -70,9 +72,10 @@ impl CounterShard {
 
 /// Lock-free HTTP counters updated on the request path.
 ///
-/// Every request increments the request counter and the in-flight gauge, so
-/// with a single copy all cores would bounce the same cache line. A thread
-/// writes to the shard of its index; snapshots sum the shards.
+/// Every request increments a request counter when it starts and a finished
+/// counter when it ends, so with a single copy all cores would bounce the same
+/// cache line. A thread writes to the shard of its index; snapshots sum the
+/// shards.
 pub(crate) struct HttpMetrics {
     /// Lifetime counters, one shard per group of threads.
     shards: [CounterShard; COUNTER_SHARDS],
@@ -301,6 +304,49 @@ mod tests {
         stats.http.end_in_flight(&route);
         assert_eq!(stats.http.in_flight(), 0);
         assert_eq!(stats.http.endpoints().snapshot()[0].in_flight, 0);
+    }
+
+    #[test]
+    fn global_in_flight_never_under_reports_while_requests_migrate() {
+        let stats = SharedStats::new(Duration::from_secs(1), "/monitor");
+        let _held = stats
+            .http
+            .begin_request("GET", "/hold", false, Instant::now());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handles_tx, handles_rx) = std::sync::mpsc::sync_channel::<RouteHandle>(0);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        // One request keeps the gauge at one or more for the whole test while
+        // another starts on one thread and finishes on the other over and over.
+        let starter = {
+            let stats = Arc::clone(&stats);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let route = stats.http.begin_request("GET", "/m", false, Instant::now());
+                    if handles_tx.send(route).is_err() || done_rx.recv().is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let finisher = {
+            let stats = Arc::clone(&stats);
+            std::thread::spawn(move || {
+                while let Ok(route) = handles_rx.recv() {
+                    stats.http.end_in_flight(&route);
+                    if done_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(400) {
+            assert!(stats.http.in_flight() >= 1);
+        }
+        stop.store(true, Ordering::Relaxed);
+        starter.join().unwrap();
+        finisher.join().unwrap();
     }
 
     #[test]

@@ -119,11 +119,12 @@ HTTP QPS and latency are computed inside the process from a 90-second ring. Ther
 Unsupported, failed, and not-yet-available process/system window metrics are encoded as `null`,
 not as a synthetic zero. CPU and network rates need two collection windows; their first snapshot is `null`. HTTP QPS is `0` until the first completed request, and latency percentiles are `null` while the selected window has no samples.
 
-Recording is lock-free: each of the first 64 recording threads writes only
-cache lines of its own (a one-second stage per ring and a gauge line per route)
-and hands a finished second to the shared ring, so request threads do not
-contend with each other. Snapshots merge the rings and the stages and count every
-sample exactly once.
+Recording a request on a known route takes no lock: each recording thread (up
+to 64 alive at once) keeps the current second of every ring and its route stamps
+on cache lines of its own and hands a finished second to the shared ring later,
+so request threads share little more than the reference counts of the rows they
+touch. Snapshots merge the rings and the staged seconds and never count a
+sample twice.
 
 Snapshots are collected only when JSON is requested and are shared within the
 configured refresh TTL. Frequent programmatic consumers can call

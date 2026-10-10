@@ -2,15 +2,15 @@
 //!
 //! Samples are first recorded into a thread-private stage that holds the
 //! current second of one thread; the stage owner moves it into the shared ring
-//! when its second ends. Snapshots read the ring and the stages together and
-//! validate every stage read against its tick, so each sample is counted
-//! exactly once.
+//! when it next records a later second. Snapshots read the ring and the stages
+//! together and validate every stage read against its tick, so no sample is
+//! ever counted twice.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{Arc, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::shard::MAX_STAGES;
+use crate::shard::{MAX_STAGES, live_indices};
 
 /// Length in seconds of the ring, and of its longest window.
 pub(crate) const WINDOW_SECS: u64 = 90;
@@ -39,16 +39,25 @@ const TICK_RESETTING: u64 = u64::MAX - 1;
 const PERCENTILES: [u32; 4] = [500, 950, 990, 999];
 /// Oldest age in seconds of a stage that is still moved into the ring.
 ///
-/// The ring slot of an older second is read by no fold any more, or is about to
-/// be recycled for the second `WINDOW_SECS` later by whichever thread reaches
-/// it first; moving samples into it could land them in that new second.
+/// Moving a stage adds its counters to the ring slot of its second, which the
+/// first thread to reach the second `WINDOW_SECS` later recycles. One second
+/// of margin keeps a move clear of that recycle unless the moving thread's
+/// clock reading is more than a second stale, which only a thread stalled for
+/// that long between taking the clock and moving its stage could produce. A
+/// stage one second older than this is still inside the window and is left
+/// where it is until it expires; the sample that found it bypasses the stage.
 const FLUSH_MAX_AGE: u64 = WINDOW_SECS - 2;
-/// Attempts a fold makes to read the stages consistently before it reports the
-/// ring alone.
+/// Attempts a fold makes to read the stages consistently.
 ///
-/// A fold yields between attempts, so a thread preempted in the middle of a
-/// stage move gets to finish it long before the attempts run out.
+/// A fold yields before its first retries and then sleeps between attempts,
+/// about thirty milliseconds in all, so a thread preempted in the middle of a
+/// stage move gets to finish it even when it is queued on another CPU. A stage
+/// still mid-move on the last attempt is left out of that one snapshot.
 const MAX_FOLD_ATTEMPTS: usize = 64;
+/// Pause between the fold attempts after the yielding ones.
+const FOLD_SHORT_PAUSE: Duration = Duration::from_micros(50);
+/// Pause between the fold attempts after the tenth.
+const FOLD_LONG_PAUSE: Duration = Duration::from_micros(500);
 
 /// Plain (non-atomic) latency histogram used to merge slots while folding.
 struct LatencyHist {
@@ -119,6 +128,10 @@ impl LatencyHist {
 }
 
 /// Lock-free counters of one second, used both as a ring slot and as a stage.
+///
+/// Aligned to 128 bytes, which covers every supported CPU's cache line, so a
+/// stage never shares a line with its neighbours.
+#[repr(align(128))]
 struct Slot {
     /// Second this slot currently holds, or [`TICK_EMPTY`] / [`TICK_RESETTING`].
     tick: AtomicU64,
@@ -366,12 +379,24 @@ impl SlidingWindow {
             self.record_direct(tick, bucket, class);
             return;
         };
-        // Only this thread writes the stage's tick, so a relaxed load is current.
+        // Only this thread writes the stage's tick, and the index pool's lock
+        // ordered a previous owner's last write before this thread got the
+        // index, so a relaxed load is current.
         let current = stage.tick.load(Ordering::Relaxed);
         if current != tick {
             // A stage past `tick` (which includes the sentinel `TICK_RESETTING`)
             // cannot take a sample of an earlier second.
             if current != TICK_EMPTY && current > tick {
+                self.record_direct(tick, bucket, class);
+                return;
+            }
+            // A second still inside the window but too close to the ring's wrap
+            // to move safely stays in the stage for snapshots to read until it
+            // expires; this sample bypasses the stage.
+            if current != TICK_EMPTY
+                && tick - current > FLUSH_MAX_AGE
+                && tick - current < WINDOW_SECS
+            {
                 self.record_direct(tick, bucket, class);
                 return;
             }
@@ -402,7 +427,9 @@ impl SlidingWindow {
     /// moving the samples it holds into the ring slot of `current`.
     ///
     /// Only the stage's owning thread calls this, so no other writer can be
-    /// adding to the stage while it is drained.
+    /// adding to the stage while it is drained. A second already outside the
+    /// window is discarded instead of moved. Nothing in here can panic, which
+    /// is what keeps the stage from being left in `TICK_RESETTING`.
     fn advance_stage(&self, stage: &Slot, current: u64, tick: u64) {
         stage.tick.store(TICK_RESETTING, Ordering::Relaxed);
         // Pairs with the acquire fence in `Slot::read`: a snapshot that observes
@@ -456,27 +483,24 @@ impl SlidingWindow {
     /// The stages are read before the ring and their ticks checked again after
     /// it; a stage that moved meanwhile has pushed samples into the ring that
     /// were also read from the stage, so the whole fold starts over. Threads
-    /// move a stage at most once per second, so a retry is rare. Should every
-    /// attempt be disturbed, the ring alone is reported: that under-reports the
-    /// staged seconds in this one snapshot and never counts a sample twice.
+    /// move a stage at most once per second, so a retry is rare. A stage caught
+    /// in the middle of a move is retried for as long as [`MAX_FOLD_ATTEMPTS`]
+    /// allows and then left out of this one snapshot, which under-reports that
+    /// thread's staged seconds once; nothing is ever counted twice.
     fn fold(&self, with_series: bool, tick: u64) -> TrafficSnapshot {
         let unix = with_series.then(unix_now);
         let mut staged = Vec::new();
         let mut observed = [TICK_EMPTY; MAX_STAGES];
         for attempt in 0..MAX_FOLD_ATTEMPTS {
             if attempt != 0 {
-                // The disturbing thread may have been preempted mid-move; give it
-                // the CPU rather than spin through the remaining attempts.
-                std::thread::yield_now();
+                back_off(attempt);
             }
-            if !self.read_stages(tick, &mut staged, &mut observed) {
-                continue;
-            }
+            let stable = self.read_stages(tick, &mut staged, &mut observed);
             let snapshot = Fold::run(self, tick, unix, &staged);
             // Pairs with the release fence of `advance_stage`: a fold that read
             // moved samples out of the ring also sees that stage's tick change.
             fence(Ordering::Acquire);
-            if self.stages_unchanged(&observed) {
+            if self.stages_unchanged(&observed) && (stable || attempt + 1 == MAX_FOLD_ATTEMPTS) {
                 return snapshot;
             }
         }
@@ -485,10 +509,13 @@ impl SlidingWindow {
     }
 
     /// Reads every stage holding a second of the window ending at `tick` into
-    /// `staged`, and every stage's tick into `observed`.
+    /// `staged`, recording the tick of each stage read into `observed`.
     ///
-    /// Returns `false` when a stage was being moved, which makes the caller
-    /// start over.
+    /// Returns `false` when a stage was being moved and was skipped, so that the
+    /// caller tries again once the move is over. Only stages that contributed
+    /// samples are recorded in `observed`: a stage that was empty, ahead of
+    /// `tick`, or already outside the window cannot move samples into a second
+    /// this fold counts.
     fn read_stages(
         &self,
         tick: u64,
@@ -496,21 +523,20 @@ impl SlidingWindow {
         observed: &mut [u64; MAX_STAGES],
     ) -> bool {
         staged.clear();
-        for (index, cell) in self.stages.iter().enumerate() {
+        observed.fill(TICK_EMPTY);
+        let mut stable = true;
+        for (index, cell) in self.stages.iter().enumerate().take(live_indices()) {
             let Some(stage) = cell.get() else {
-                observed[index] = TICK_EMPTY;
                 continue;
             };
             let stage_tick = stage.tick.load(Ordering::Acquire);
-            observed[index] = stage_tick;
             if stage_tick == TICK_EMPTY {
                 continue;
             }
             if stage_tick == TICK_RESETTING {
-                return false;
+                stable = false;
+                continue;
             }
-            // A second ahead of this fold's clock, or already outside the
-            // window, is not part of this snapshot.
             if stage_tick > tick || tick - stage_tick >= WINDOW_SECS {
                 continue;
             }
@@ -525,20 +551,18 @@ impl SlidingWindow {
                     entry.requests = requests;
                     entry.status = status;
                     staged.push(entry);
+                    observed[index] = stage_tick;
                 }
                 Some(_) => {}
-                None => return false,
+                None => stable = false,
             }
         }
-        true
+        stable
     }
 
-    /// Returns `true` when no stage that held a second when `observed` was
-    /// taken has moved since.
+    /// Returns `true` when no stage recorded in `observed` has moved since.
     fn stages_unchanged(&self, observed: &[u64; MAX_STAGES]) -> bool {
         self.stages.iter().zip(observed).all(|(cell, &before)| {
-            // An empty stage cannot have moved anything into the ring; a second
-            // it gained meanwhile is reported by the next snapshot.
             before == TICK_EMPTY
                 || cell
                     .get()
@@ -727,6 +751,21 @@ impl<'a> Fold<'a> {
     }
 }
 
+/// Waits before fold attempt `attempt`.
+///
+/// A stage move takes microseconds, so the first retries only yield; the later
+/// ones sleep, which lets a mover that was preempted mid-move run again even
+/// when it is queued on another CPU.
+fn back_off(attempt: usize) {
+    if attempt <= 2 {
+        std::thread::yield_now();
+    } else if attempt <= 10 {
+        std::thread::sleep(FOLD_SHORT_PAUSE);
+    } else {
+        std::thread::sleep(FOLD_LONG_PAUSE);
+    }
+}
+
 /// Builds the aggregate of a `window`-second window ending at `tick`.
 fn finish_agg(
     window: u64,
@@ -839,7 +878,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
-    use crate::shard::thread_index;
+    use crate::shard::warm_indices;
 
     use super::*;
 
@@ -862,27 +901,28 @@ mod tests {
 
     #[test]
     fn stage_holds_the_current_second_and_moves_into_the_ring() {
+        warm_indices(1);
         let window = SlidingWindow::new();
-        let index = thread_index().unwrap();
-        let tick = window.current_tick();
-        window.observe(1_000_000, 2);
+        let tick = 10;
+        let (bucket, class) = sample_of(1_000_000, 2);
+        window.record(Some(0), tick, bucket, class);
 
-        let stage = window.stages[index].get().expect("stage allocated");
+        let stage = window.stages[0].get().expect("stage allocated");
         assert_eq!(stage.tick.load(Ordering::Relaxed), tick);
         assert_eq!(stage.requests.load(Ordering::Relaxed), 1);
         assert_eq!(ring_tick(&window, tick), TICK_EMPTY);
 
-        let snap = window.snapshot();
+        let snap = window.fold(true, tick);
         assert_eq!(snap.window_30.requests, 1);
         assert!(snap.window_30.p50_ns.is_some());
         assert_eq!(snap.series[89].requests, 1);
         assert!(snap.series[89].p50_ns.is_some());
-        let (window_30, _, window_90) = window.snapshot_windows();
+        let (window_30, _, window_90) = window.snapshot_windows_at(tick);
         assert_eq!(window_30.requests, 1);
         assert!(window_90.p50_ns.is_some());
 
-        window.advance_secs(1);
-        window.observe(2_000_000, 4);
+        let (bucket, class) = sample_of(2_000_000, 4);
+        window.record(Some(0), tick + 1, bucket, class);
         assert_eq!(stage.tick.load(Ordering::Relaxed), tick + 1);
         assert_eq!(stage.requests.load(Ordering::Relaxed), 1);
         assert_eq!(ring_tick(&window, tick), tick);
@@ -890,13 +930,68 @@ mod tests {
         assert_eq!(moved.requests.load(Ordering::Relaxed), 1);
         assert_eq!(moved.status[1].load(Ordering::Relaxed), 1);
 
-        let snap = window.snapshot();
+        let snap = window.fold(true, tick + 1);
         assert_eq!(snap.window_90.requests, 2);
         assert_eq!(snap.window_90.status[1], 1);
         assert_eq!(snap.window_90.status[3], 1);
         assert_eq!(snap.series[88].requests, 1);
         assert_eq!(snap.series[89].requests, 1);
         assert!(snap.series[88].p50_ns.is_some());
+    }
+
+    #[test]
+    fn second_at_the_oldest_movable_age_is_moved_into_the_ring() {
+        warm_indices(1);
+        let window = SlidingWindow::new();
+        let (bucket, class) = sample_of(1_000_000, 2);
+        let tick = 7;
+        window.record(Some(0), tick, bucket, class);
+        window.record(Some(0), tick + FLUSH_MAX_AGE, bucket, class);
+        assert_eq!(ring_tick(&window, tick), tick);
+        let stage = window.stages[0].get().expect("stage allocated");
+        assert_eq!(stage.tick.load(Ordering::Relaxed), tick + FLUSH_MAX_AGE);
+        let snap = window.fold(true, tick + FLUSH_MAX_AGE);
+        assert_eq!(snap.window_90.requests, 2);
+        assert_eq!(snap.series[1].requests, 1);
+        assert_eq!(snap.series[89].requests, 1);
+    }
+
+    #[test]
+    fn a_second_split_between_the_ring_and_a_stage_is_merged() {
+        warm_indices(1);
+        let window = SlidingWindow::new();
+        let (fast, class) = sample_of(1_000_000, 2);
+        let (slow, _) = sample_of(50_000_000, 2);
+        window.record(None, 20, fast, class);
+        window.record(Some(0), 20, slow, class);
+        let snap = window.fold(true, 20);
+        assert_eq!(snap.series[89].requests, 2);
+        assert!(snap.series[89].p50_ns.unwrap() < 50_000_000);
+        assert!(snap.series[89].p99_ns.unwrap() >= 50_000_000);
+        assert_eq!(snap.window_30.requests, 2);
+        assert!(snap.window_30.p99_ns.unwrap() >= 50_000_000);
+    }
+
+    #[test]
+    fn a_stage_moved_during_a_fold_is_detected_and_the_fold_repeated() {
+        warm_indices(1);
+        let window = SlidingWindow::new();
+        let (bucket, class) = sample_of(1_000_000, 2);
+        window.record(Some(0), 10, bucket, class);
+        window.record(Some(0), 10, bucket, class);
+        let mut staged = Vec::new();
+        let mut observed = [TICK_EMPTY; MAX_STAGES];
+        assert!(window.read_stages(11, &mut staged, &mut observed));
+        assert_eq!(staged.len(), 1);
+
+        // The stage moves after it was read: the ring now holds the two samples
+        // the fold also took from the stage, so a fold that trusted its read
+        // would count them twice.
+        window.record(Some(0), 11, bucket, class);
+        let torn = Fold::run(&window, 11, None, &staged);
+        assert_eq!(torn.window_90.requests, 4);
+        assert!(!window.stages_unchanged(&observed));
+        assert_eq!(window.fold(false, 11).window_90.requests, 3);
     }
 
     #[test]
@@ -912,17 +1007,55 @@ mod tests {
     }
 
     #[test]
-    fn stale_stage_is_dropped_instead_of_moved() {
+    fn second_near_the_ring_wrap_is_kept_until_it_expires() {
+        warm_indices(1);
         let window = SlidingWindow::new();
-        let tick = window.current_tick();
-        window.observe(1_000_000, 2);
-        window.advance_secs(FLUSH_MAX_AGE + 1);
-        window.observe(2_000_000, 2);
-        // The old second was too old to move safely; its ring slot stays untouched.
+        let (bucket, class) = sample_of(1_000_000, 2);
+        let tick = 5;
+        window.record(Some(0), tick, bucket, class);
+        let stage = window.stages[0].get().expect("stage allocated");
+
+        // One second before the ring wraps the old second is still in the
+        // window: it stays in the stage, its ring slot is untouched, and the new
+        // sample goes straight into the ring.
+        let near = tick + FLUSH_MAX_AGE + 1;
+        window.record(Some(0), near, bucket, class);
+        assert_eq!(stage.tick.load(Ordering::Relaxed), tick);
         assert_eq!(ring_tick(&window, tick), TICK_EMPTY);
-        let snap = window.snapshot();
-        assert_eq!(snap.window_90.requests, 1);
+        assert_eq!(ring_tick(&window, near), near);
+        let snap = window.fold(true, near);
+        assert_eq!(snap.window_90.requests, 2);
+        assert_eq!(snap.series[0].requests, 1);
         assert_eq!(snap.series[89].requests, 1);
+
+        // Once the old second has expired the stage is cleared, not moved.
+        let expired = tick + WINDOW_SECS;
+        window.record(Some(0), expired, bucket, class);
+        assert_eq!(stage.tick.load(Ordering::Relaxed), expired);
+        assert_eq!(stage.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(ring_tick(&window, tick), TICK_EMPTY);
+        let snap = window.fold(true, expired);
+        assert_eq!(snap.window_90.requests, 2);
+        assert_eq!(snap.series[88].requests, 1);
+        assert_eq!(snap.series[89].requests, 1);
+    }
+
+    #[test]
+    fn fold_keeps_the_stable_stages_when_one_is_stuck_mid_move() {
+        warm_indices(2);
+        let window = SlidingWindow::new();
+        let (bucket, class) = sample_of(1_000_000, 2);
+        window.record(Some(0), 30, bucket, class);
+        window.record(Some(1), 30, bucket, class);
+        let stage = window.stages[0].get().expect("stage allocated");
+
+        // A mover preempted in the middle of its move leaves its stage marked;
+        // the snapshot waits, then reports every other stage.
+        stage.tick.store(TICK_RESETTING, Ordering::Relaxed);
+        let disturbed = window.fold(true, 30);
+        stage.tick.store(30, Ordering::Relaxed);
+        assert_eq!(disturbed.window_90.requests, 1);
+        assert_eq!(window.fold(true, 30).window_90.requests, 2);
     }
 
     #[test]
@@ -1047,7 +1180,7 @@ mod tests {
 
     #[test]
     fn snapshots_taken_during_stage_moves_count_every_sample_once() {
-        const THREADS: usize = 4;
+        const THREADS: usize = 3;
         let window = Arc::new(SlidingWindow::new());
         // Each recorder counts a sample before and after recording it, so the
         // samples a snapshot may see lie between the finished total read before
@@ -1080,11 +1213,11 @@ mod tests {
         };
 
         // Advancing the clock makes every recorder move its stage, so the
-        // snapshots below overlap stage moves constantly.
+        // snapshots below often overlap stage moves.
         let started = Instant::now();
         let mut rounds = 0;
         while started.elapsed() < Duration::from_millis(400) {
-            if rounds % 20 == 0 {
+            if rounds % 5 == 0 {
                 window.advance_secs(1);
             }
             let finished_before = sum(&finished_count);
@@ -1117,7 +1250,10 @@ mod tests {
     }
 
     #[test]
-    fn slot_layout_stays_compact() {
-        assert!(std::mem::size_of::<Slot>() <= 1_152);
+    fn slot_layout_matches_the_crate_docs() {
+        assert_eq!(std::mem::size_of::<Slot>(), 1_152);
+        assert_eq!(std::mem::align_of::<Slot>(), 128);
+        // A ring: 90 slots plus the stage cells, about 102 KiB.
+        assert!(std::mem::size_of::<SlidingWindow>() <= 105 * 1024);
     }
 }

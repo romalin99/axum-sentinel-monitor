@@ -12,21 +12,31 @@
 //!
 //! # Recording cost
 //!
-//! Recording is lock-free. Each of the first 64 threads that record owns a
-//! stage in every ring and a gauge line in every route, so a request on such a
-//! thread writes only cache lines of its own; a stage holds one second and is
-//! moved into the shared ring when that second ends. Threads beyond the first
-//! 64 record straight into the shared ring, which is exact but contended.
-//! Snapshots read the rings and the stages together and validate every stage
-//! read, so each sample is counted exactly once; a snapshot disturbed by stage
-//! moves on every one of its attempts reports the rings alone, under-reporting
-//! the staged seconds once and never counting a sample twice.
+//! A request on a known route takes no lock. Every thread that records takes
+//! an index, and indices are reused when threads exit; the 64 lowest indices
+//! each own a stage in every ring and a stamp line in every route, so for up
+//! to 64 recording threads alive at once the counters a request updates live on
+//! cache lines of their own. What a request still shares with other threads is
+//! the reference count of the route row and of the monitor state, plus the
+//! row's in-flight gauge, which sits on the line the reference count already
+//! touches. A stage holds one second of one thread; the thread moves it into
+//! the shared ring when it next records a later second, so an idle thread's
+//! last second stays in its stage until it expires. Threads with higher
+//! indices record straight into the shared ring, which is exact but contended,
+//! and a route the thread has not seen since the last eviction is resolved
+//! under the route table's lock.
 //!
-//! Memory per ring is 98 KiB plus 1,152 bytes per recording thread; each route
-//! adds a ring and 4 KiB of gauge lines, so a full table of 64 routes with 8
-//! recording threads holds about 7 MiB. Rows are freed when they are evicted,
-//! except that a thread's route cache keeps up to 256 rows alive until that
-//! thread's next lookup after an eviction.
+//! Snapshots read the rings and the stages together and validate every stage
+//! read, so no sample is ever counted twice. A thread caught in the middle of a
+//! stage move is waited for, up to about thirty milliseconds; a stage still
+//! moving after that is left out of that one snapshot.
+//!
+//! Memory per ring is about 102 KiB plus 1,152 bytes per recording thread;
+//! each route adds a ring and 8 KiB of stamp lines, so a full table of 64 routes
+//! holds about 8 MiB with 8 recording threads and about 12 MiB with 64. Rows
+//! are freed when they are evicted, except that a thread's route cache, of at
+//! most 256 entries, keeps the rows it resolved alive until that thread's next
+//! lookup after an eviction or in another monitor.
 //!
 //! # Examples
 //!
@@ -536,6 +546,24 @@ mod tests {
         assert_eq!(hold.method, "GET");
         assert_eq!(hold.in_flight, 1);
         pending.abort();
+    }
+
+    #[tokio::test]
+    async fn layer_caches_matched_routes_under_their_template() {
+        let monitor = Monitor::default();
+        let app = Router::new()
+            .route("/items/{id}", get(|| async { "item" }))
+            .layer(monitor.layer());
+        let _ = app
+            .oneshot(Request::get("/items/42").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        // The request ran on this thread, so its cache holds the template Axum
+        // matched rather than the normalized request path.
+        assert!(endpoints::thread_cache_has(&endpoints::raw_key(
+            "GET",
+            "/items/{id}"
+        )));
     }
 
     #[tokio::test]

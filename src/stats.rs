@@ -1,6 +1,6 @@
 //! Shared monitor state: live HTTP counters and the cached snapshot.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, PoisonError, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -41,18 +41,18 @@ struct CacheEntry {
     cached_at: Instant,
 }
 
-/// One shard of the lifetime counters, padded to its own cache line so that
-/// threads on different shards never share a line.
-#[repr(align(64))]
+/// One shard of the lifetime counters, padded to a cache line of its own
+/// (128 bytes covers every supported CPU) so that threads never share one.
+#[repr(align(128))]
 struct CounterShard {
     /// Requests started since creation.
     requests: AtomicU64,
-    /// Requests started minus requests finished.
+    /// Requests finished since creation.
     ///
-    /// Signed because a request may start on one shard and finish on another
-    /// when its task migrates between worker threads; only the sum over all
-    /// shards is meaningful.
-    in_flight: AtomicI64,
+    /// A request may start on one shard and finish on another when its task
+    /// migrates between worker threads, so only the sums over all shards are
+    /// meaningful.
+    finished: AtomicU64,
     /// Responses per status class since creation, indexed `1xx` to `5xx`.
     status: [AtomicU64; 5],
 }
@@ -62,7 +62,7 @@ impl CounterShard {
     fn new() -> Self {
         Self {
             requests: AtomicU64::new(0),
-            in_flight: AtomicI64::new(0),
+            finished: AtomicU64::new(0),
             status: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -186,7 +186,6 @@ impl HttpMetrics {
         let thread = thread_index();
         let shard = &self.shards[counter_shard(thread)];
         shard.requests.fetch_add(1, Ordering::Relaxed);
-        shard.in_flight.fetch_add(1, Ordering::Relaxed);
         self.endpoints.begin(method, path, matched, thread, now)
     }
 
@@ -221,15 +220,25 @@ impl HttpMetrics {
     }
 
     /// Returns the requests currently being handled.
+    ///
+    /// The finishes are summed before the starts: every finish counted below
+    /// has its start counted too, so the difference never falls short of the
+    /// requests in flight while the shards are read, and never goes negative.
     pub(crate) fn in_flight(&self) -> u64 {
-        let total: i64 = self
+        let finished: u64 = self
             .shards
             .iter()
-            .map(|shard| shard.in_flight.load(Ordering::Relaxed))
+            .map(|shard| shard.finished.load(Ordering::Relaxed))
             .sum();
-        // Starts and finishes of one request may be read from different shards
-        // at different moments, so the sum can briefly dip below zero.
-        u64::try_from(total).unwrap_or(0)
+        // Pairs with the release add in `end_in_flight`, which happens after
+        // the request's start was counted.
+        fence(Ordering::Acquire);
+        let started: u64 = self
+            .shards
+            .iter()
+            .map(|shard| shard.requests.load(Ordering::Relaxed))
+            .sum();
+        started.saturating_sub(finished)
     }
 
     /// Returns the responses per status class since creation, indexed `1xx` to
@@ -253,13 +262,13 @@ impl HttpMetrics {
         &self.endpoints
     }
 
-    /// Decrements the global and per-route in-flight gauges.
+    /// Counts a request as finished on the global and the per-route gauges.
     pub(crate) fn end_in_flight(&self, route: &RouteHandle) {
         let thread = thread_index();
         self.shards[counter_shard(thread)]
-            .in_flight
-            .fetch_sub(1, Ordering::Relaxed);
-        route.end(thread);
+            .finished
+            .fetch_add(1, Ordering::Release);
+        route.end();
     }
 }
 

@@ -3,12 +3,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
 use crate::histogram::{SlidingWindow, WINDOW_SECS, WindowAgg};
-use crate::shard::{MAX_STAGES, gauge_line};
+use crate::shard::{MAX_STAGES, gauge_line, live_indices};
 
 /// Upper bound on tracked routes.
 ///
@@ -43,6 +43,14 @@ type RouteKey = String;
 
 /// Separator between the method and the path inside a [`RouteKey`].
 const KEY_SEPARATOR: char = ' ';
+
+/// Separator between the method and the route template inside a raw cache key.
+///
+/// It differs from [`KEY_SEPARATOR`] so that a raw key can never equal the
+/// normalized key of another route: a template that is a valid normalized path
+/// but normalizes to something else (a literal segment of 48 digits, say) would
+/// otherwise share a cache entry with the request paths that normalize to it.
+const RAW_KEY_SEPARATOR: char = '\0';
 
 /// Key of the shared row that absorbs new routes while every row is in flight.
 const OVERFLOW_KEY: &str = "* /...";
@@ -164,18 +172,25 @@ fn split_key(key: &str) -> (&str, &str) {
     key.split_once(KEY_SEPARATOR).unwrap_or((key, "/"))
 }
 
-/// Gauges of one route written by the threads mapped to one line.
+/// Returns the raw cache key of a matched route template.
+#[cfg(test)]
+pub(crate) fn raw_key(method: &str, template: &str) -> String {
+    format!("{method}{RAW_KEY_SEPARATOR}{template}")
+}
+
+/// Returns `true` when the current thread's route cache holds `key`.
+#[cfg(test)]
+pub(crate) fn thread_cache_has(key: &str) -> bool {
+    LOCAL.with(|local| local.borrow().cache.contains_key(key))
+}
+
+/// Stamps of one route written by the threads mapped to one line.
 ///
-/// Each thread writes the line of its own index, so a request touches no gauge
-/// line another core writes; the row's values are sums or maxima over the lines.
-#[repr(align(64))]
+/// Each thread writes the line of its own index, so a request touches no stamp
+/// line another core writes; the row's values are maxima over the lines. The
+/// line is 128 bytes, which covers every supported CPU's cache line.
+#[repr(align(128))]
 struct RouteGauge {
-    /// Requests started minus requests finished on this line.
-    ///
-    /// Signed because a request may start on one line and finish on another
-    /// when its task migrates between worker threads; only the sum over all
-    /// lines is meaningful.
-    in_flight: AtomicI64,
     /// Nanoseconds since the table's origin at the last lookup on this line;
     /// the maximum over the lines orders rows for LRU eviction.
     last_used: AtomicU64,
@@ -191,7 +206,6 @@ impl RouteGauge {
     /// Creates a zeroed gauge line.
     fn new() -> Self {
         Self {
-            in_flight: AtomicI64::new(0),
             last_used: AtomicU64::new(0),
             last_observe: AtomicU64::new(0),
         }
@@ -199,10 +213,19 @@ impl RouteGauge {
 }
 
 /// Metrics of one tracked route.
+///
+/// The layout is fixed so the in-flight gauge shares its cache line with the
+/// `Arc` reference counts in front of it. Every request already writes that line
+/// when it clones and drops its handle, so keeping the gauge there costs no
+/// further cross-core traffic, while keeping it a single counter makes eviction
+/// read an exact value: a row with a request in flight is never evicted.
+#[repr(C)]
 struct RouteMetrics {
+    /// Requests of this route currently being handled.
+    in_flight: AtomicU64,
     /// Completed requests of this route over the trailing window.
     window: SlidingWindow,
-    /// One gauge line per thread index.
+    /// One stamp line per thread index.
     gauges: Box<[RouteGauge; MAX_STAGES]>,
 }
 
@@ -215,22 +238,19 @@ impl RouteMetrics {
             .store(stamp, Ordering::Relaxed);
     }
 
-    /// Returns the requests currently being handled, summed over the lines.
-    ///
-    /// Starts and finishes of one request may be read from different lines at
-    /// different moments, so the sum can briefly dip below zero.
+    /// Returns the requests currently being handled.
     fn in_flight(&self) -> u64 {
-        let total: i64 = self
-            .gauges
-            .iter()
-            .map(|gauge| gauge.in_flight.load(Ordering::Relaxed))
-            .sum();
-        u64::try_from(total).unwrap_or(0)
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Returns the stamp lines that a thread has ever written.
+    fn used_gauges(&self) -> &[RouteGauge] {
+        &self.gauges[..live_indices()]
     }
 
     /// Returns the LRU stamp of the most recent lookup on any line.
     fn last_used(&self) -> u64 {
-        self.gauges
+        self.used_gauges()
             .iter()
             .map(|gauge| gauge.last_used.load(Ordering::Relaxed))
             .max()
@@ -240,7 +260,7 @@ impl RouteMetrics {
     /// Returns `true` when no request completed inside the window ending at `tick`.
     fn is_cold(&self, tick: u64) -> bool {
         let last_observe = self
-            .gauges
+            .used_gauges()
             .iter()
             .map(|gauge| gauge.last_observe.load(Ordering::Relaxed))
             .max()
@@ -259,11 +279,9 @@ impl RouteMetrics {
 pub(crate) struct RouteHandle(Arc<RouteMetrics>);
 
 impl RouteHandle {
-    /// Counts the request as finished on the line of thread `thread`.
-    pub(crate) fn end(&self, thread: Option<usize>) {
-        self.0.gauges[gauge_line(thread)]
-            .in_flight
-            .fetch_sub(1, Ordering::Relaxed);
+    /// Decrements the route's in-flight gauge, saturating at zero.
+    pub(crate) fn end(&self) {
+        saturating_dec(&self.0.in_flight);
     }
 }
 
@@ -324,9 +342,7 @@ impl EndpointSet {
         now: Instant,
     ) -> RouteHandle {
         let metrics = self.route_metrics(method, path, matched, thread, now);
-        metrics.gauges[gauge_line(thread)]
-            .in_flight
-            .fetch_add(1, Ordering::Relaxed);
+        metrics.in_flight.fetch_add(1, Ordering::Relaxed);
         RouteHandle(metrics)
     }
 
@@ -515,9 +531,22 @@ impl EndpointSet {
     /// Creates an empty row on this table's time base.
     fn new_metrics(&self) -> Arc<RouteMetrics> {
         Arc::new(RouteMetrics {
+            in_flight: AtomicU64::new(0),
             window: SlidingWindow::with_clock(self.origin, Arc::clone(&self.extra_secs)),
             gauges: Box::new(std::array::from_fn(|_| RouteGauge::new())),
         })
+    }
+}
+
+/// Decrements `value` unless it is already zero.
+///
+/// The decrement is unconditional and undone when it underflowed: one atomic
+/// instead of a load plus compare-and-swap on the common path. The underflow
+/// only happens on a double release, which the guards never do, so the wrapped
+/// value is never observed in practice.
+fn saturating_dec(value: &AtomicU64) {
+    if value.fetch_sub(1, Ordering::Relaxed) == 0 {
+        value.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -552,16 +581,17 @@ fn evict_one(routes: &mut RouteMap, tick: u64) -> bool {
 }
 
 /// Appends the cache lookup key of a request to `out` and returns whether it is
-/// the raw `"<METHOD> <template>"` form rather than the normalized key.
+/// the raw `"<METHOD>\0<template>"` form rather than the normalized key.
 ///
 /// The raw form is used only for a matched route template with a plain
 /// upper-case method and a bounded length: the template space is then bounded
 /// by the router's routes, and the method needs no folding, so the raw key
-/// names the same route as the normalized one.
+/// names the same route as the normalized one. Its separator keeps it apart
+/// from every normalized key.
 fn write_lookup_key(out: &mut String, method: &str, path: &str, matched: bool) -> bool {
     if matched && is_plain_method(method) && path.len() <= MAX_PATH_CHARS {
         out.push_str(method);
-        out.push(KEY_SEPARATOR);
+        out.push(RAW_KEY_SEPARATOR);
         out.push_str(path);
         return true;
     }
@@ -711,7 +741,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use crate::shard::thread_index;
+    use crate::shard::{thread_index, warm_indices};
 
     use super::*;
 
@@ -771,16 +801,16 @@ mod tests {
         let thread = thread_index();
         let first = set.begin("GET", "/items/{id}", true, thread, Instant::now());
         let second = set.begin("GET", "/items/{id}", true, thread, Instant::now());
-        // Both lookups resolve to one row, and the raw template is what the
-        // thread cache holds.
+        // A hit on the raw template key is what lets a matched request skip
+        // normalization.
         assert!(Arc::ptr_eq(&first.0, &second.0));
-        assert!(LOCAL.with(|local| local.borrow().cache.contains_key("GET /items/{id}")));
+        assert!(thread_cache_has(&raw_key("GET", "/items/{id}")));
         // A request without a template for the same route shares the row.
         let third = set.begin("GET", "/items/42", false, thread, Instant::now());
         assert!(Arc::ptr_eq(&first.0, &third.0));
-        first.end(thread);
-        second.end(thread);
-        third.end(thread);
+        first.end();
+        second.end();
+        third.end();
 
         let rows = set.snapshot();
         assert_eq!(rows.len(), 1);
@@ -789,24 +819,96 @@ mod tests {
     }
 
     #[test]
+    fn raw_template_keys_never_collide_with_normalized_keys() {
+        let set = new_set();
+        let thread = thread_index();
+        // A literal route whose only segment is 48 digits normalizes to `:id`,
+        // while a request path one character longer is cut back to exactly the
+        // template text by the segment limit.
+        let template = format!("/keys/{}", "1".repeat(MAX_SEGMENT_CHARS));
+        let unmatched = format!("{template}x");
+        set.begin("GET", &unmatched, false, thread, Instant::now())
+            .end();
+        set.begin("GET", &template, true, thread, Instant::now())
+            .end();
+        set.begin("GET", &template, true, thread, Instant::now())
+            .end();
+        let mut paths: Vec<String> = set.snapshot().into_iter().map(|row| row.path).collect();
+        paths.sort();
+        assert_eq!(paths, vec![template, "/keys/:id".to_owned()]);
+    }
+
+    #[test]
+    fn gauge_lines_and_in_flight_have_the_documented_layout() {
+        assert_eq!(std::mem::size_of::<RouteGauge>(), 128);
+        assert_eq!(std::mem::align_of::<RouteGauge>(), 128);
+        // The in-flight gauge is the first field, right behind the `Arc` counts.
+        assert_eq!(std::mem::offset_of!(RouteMetrics, in_flight), 0);
+    }
+
+    #[test]
     fn unusual_methods_and_long_templates_skip_the_raw_cache() {
         let set = new_set();
         let thread = thread_index();
         let long = format!("/{}", "a".repeat(MAX_PATH_CHARS + 1));
         set.begin("get", "/items/{id}", true, thread, Instant::now())
-            .end(thread);
-        set.begin("GET", &long, true, thread, Instant::now())
-            .end(thread);
-        LOCAL.with(|local| {
-            let local = local.borrow();
-            assert!(local.cache.contains_key("GET /items/:id"));
-            assert!(
-                local
-                    .cache
-                    .keys()
-                    .all(|key| key.len() <= MAX_PATH_CHARS + MAX_METHOD_CHARS + 1)
-            );
-        });
+            .end();
+        set.begin("GET", &long, true, thread, Instant::now()).end();
+        assert!(thread_cache_has("GET /items/:id"));
+        assert!(!thread_cache_has(&raw_key("get", "/items/{id}")));
+        assert!(!thread_cache_has(&raw_key("GET", &long)));
+    }
+
+    #[test]
+    fn thread_cache_is_emptied_when_it_reaches_its_limit() {
+        let set = new_set();
+        let thread = thread_index();
+        let mut peak = 0;
+        // Every template normalizes to the same route, so the table never
+        // evicts and only the limit can empty the cache.
+        for index in 0..(LOCAL_CACHE_LIMIT * 4) {
+            set.begin(
+                "GET",
+                &format!("/v/{index:08x}"),
+                true,
+                thread,
+                Instant::now(),
+            )
+            .end();
+            let len = local_cache_len(&set);
+            assert!(len <= LOCAL_CACHE_LIMIT);
+            peak = peak.max(len);
+        }
+        assert_eq!(peak, LOCAL_CACHE_LIMIT);
+        assert_eq!(set.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn lru_order_uses_the_newest_stamp_over_all_lines() {
+        warm_indices(2);
+        let set = new_set();
+        // Row A is used on line 0 first and on line 1 last, with row B in
+        // between on line 0: A's newest stamp is not on the line it started on.
+        set.begin("GET", "/a", false, Some(0), Instant::now()).end();
+        set.begin("GET", "/b", false, Some(0), Instant::now()).end();
+        set.begin("GET", "/a", false, Some(1), Instant::now()).end();
+        for index in 0..(MAX_ENDPOINTS - 2) {
+            set.begin(
+                "GET",
+                &format!("/route-{index}"),
+                false,
+                Some(0),
+                Instant::now(),
+            )
+            .end();
+        }
+        assert_eq!(set.snapshot().len(), MAX_ENDPOINTS);
+        set.begin("GET", "/fresh", false, Some(0), Instant::now())
+            .end();
+        let paths: Vec<String> = set.snapshot().into_iter().map(|row| row.path).collect();
+        assert_eq!(paths.len(), MAX_ENDPOINTS);
+        assert!(paths.iter().any(|path| path == "/a"));
+        assert!(!paths.iter().any(|path| path == "/b"));
     }
 
     #[test]
@@ -854,9 +956,9 @@ mod tests {
         assert_eq!(rows[0].window_60.requests, 0);
         assert_eq!(rows[1].path, "/work");
         assert_eq!(rows[1].window_60.requests, 2);
-        first.end(thread);
+        first.end();
         assert_eq!(set.snapshot()[0].in_flight, 1);
-        second.end(thread);
+        second.end();
         let idle = set.snapshot();
         assert_eq!(
             idle.iter()
@@ -876,17 +978,17 @@ mod tests {
         let ended = {
             let set = Arc::clone(&set);
             std::thread::spawn(move || {
-                handle.end(thread_index());
+                handle.end();
                 set.snapshot()[0].in_flight
             })
             .join()
             .unwrap()
         };
         assert_eq!(ended, 0);
-        // The lines now hold +1 and -1; a new request still reads as one in flight.
+        // A request that finished on another thread leaves the gauge exact.
         let again = set.begin("GET", "/migrate", false, thread_index(), Instant::now());
         assert_eq!(set.snapshot()[0].in_flight, 1);
-        again.end(thread_index());
+        again.end();
         assert_eq!(set.snapshot()[0].in_flight, 0);
     }
 
@@ -965,7 +1067,7 @@ mod tests {
             .expect("in-flight row survives eviction");
         assert_eq!(row.in_flight, 1);
 
-        hold.end(thread);
+        hold.end();
         let idle = set.snapshot();
         assert_eq!(
             idle.iter()
@@ -1000,7 +1102,7 @@ mod tests {
             .expect("overflow row when nothing is evictable");
         assert_eq!(overflow.in_flight, 1);
 
-        extra.end(thread);
+        extra.end();
         let drained = set.snapshot();
         assert_eq!(
             drained
@@ -1027,7 +1129,7 @@ mod tests {
         // `begin`/`end` refresh the LRU position without recording a request, so
         // `/stale` is now the most recently used row yet still has an empty window.
         set.begin("GET", "/stale", false, thread, Instant::now())
-            .end(thread);
+            .end();
         set.observe_path("GET", "/fresh", 1_000_000, 2);
 
         let paths: Vec<String> = set.snapshot().into_iter().map(|row| row.path).collect();
@@ -1052,13 +1154,13 @@ mod tests {
         // The same holds for raw template keys.
         first
             .begin("GET", "/t/{id}", true, thread, Instant::now())
-            .end(thread);
+            .end();
         second
             .begin("GET", "/t/{id}", true, thread, Instant::now())
-            .end(thread);
+            .end();
         first
             .begin("GET", "/t/{id}", true, thread, Instant::now())
-            .end(thread);
+            .end();
         assert_eq!(first.snapshot().len(), 2);
         assert_eq!(second.snapshot().len(), 2);
     }
@@ -1076,7 +1178,7 @@ mod tests {
                     barrier.wait();
                     let thread = thread_index();
                     set.begin("GET", "/shared", false, thread, Instant::now())
-                        .end(thread);
+                        .end();
                 })
             })
             .collect();

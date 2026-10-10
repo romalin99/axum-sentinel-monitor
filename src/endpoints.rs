@@ -212,6 +212,13 @@ impl RouteGauge {
     }
 }
 
+/// Bytes that separate the in-flight gauge from the rest of a row.
+///
+/// Together with the `Arc` counts (16 bytes) and the gauge (8 bytes) they fill
+/// 128 bytes, the widest cache line of a supported CPU, so the fields a request
+/// only reads never share a line with the counts every request writes.
+const ROW_HEADER_PADDING: usize = 128 - 16 - 8;
+
 /// Metrics of one tracked route.
 ///
 /// The layout is fixed so the in-flight gauge shares its cache line with the
@@ -223,6 +230,8 @@ impl RouteGauge {
 struct RouteMetrics {
     /// Requests of this route currently being handled.
     in_flight: AtomicU64,
+    /// Keeps the fields below off the line of the counts and the gauge.
+    header_padding: [u8; ROW_HEADER_PADDING],
     /// Completed requests of this route over the trailing window.
     window: SlidingWindow,
     /// One stamp line per thread index.
@@ -532,6 +541,7 @@ impl EndpointSet {
     fn new_metrics(&self) -> Arc<RouteMetrics> {
         Arc::new(RouteMetrics {
             in_flight: AtomicU64::new(0),
+            header_padding: [0; ROW_HEADER_PADDING],
             window: SlidingWindow::with_clock(self.origin, Arc::clone(&self.extra_secs)),
             gauges: Box::new(std::array::from_fn(|_| RouteGauge::new())),
         })
@@ -842,8 +852,11 @@ mod tests {
     fn gauge_lines_and_in_flight_have_the_documented_layout() {
         assert_eq!(std::mem::size_of::<RouteGauge>(), 128);
         assert_eq!(std::mem::align_of::<RouteGauge>(), 128);
-        // The in-flight gauge is the first field, right behind the `Arc` counts.
+        // The in-flight gauge is the first field, right behind the `Arc` counts,
+        // and everything else starts one full line later.
         assert_eq!(std::mem::offset_of!(RouteMetrics, in_flight), 0);
+        assert_eq!(std::mem::offset_of!(RouteMetrics, window), 128 - 16);
+        assert!(std::mem::align_of::<RouteMetrics>() <= 16);
     }
 
     #[test]

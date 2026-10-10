@@ -166,7 +166,7 @@ impl Slot {
     }
 
     /// Moves every counter into `dst`, leaving this slot zeroed; the caller must
-    /// hold this slot in [`TICK_RESETTING`].
+    /// be the stage's owner and hold this slot in [`TICK_RESETTING`].
     fn drain_into(&self, dst: &Slot) {
         move_count(&self.requests, &dst.requests);
         for (src, dst) in self.status.iter().zip(&dst.status) {
@@ -177,13 +177,24 @@ impl Slot {
         }
     }
 
-    /// Adds one sample to the counters; the caller must have checked the tick.
+    /// Adds one sample to a ring slot, which several threads write; the caller
+    /// must have checked the tick.
     fn add(&self, bucket: usize, class: Option<usize>) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         if let Some(class) = class {
             self.status[class].fetch_add(1, Ordering::Relaxed);
         }
         self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Adds one sample to a stage, which only its owning thread writes, so a
+    /// load and a store replace each locked read-modify-write.
+    fn add_owned(&self, bucket: usize, class: Option<usize>) {
+        bump(&self.requests);
+        if let Some(class) = class {
+            bump(&self.status[class]);
+        }
+        bump(&self.buckets[bucket]);
     }
 
     /// Loads this slot into `hist` when it still belongs to `expected_tick`.
@@ -223,10 +234,20 @@ impl Slot {
     }
 }
 
-/// Moves the count of `src` onto `dst`, skipping the shared add when it is zero.
+/// Increments a counter that only the calling thread writes.
+fn bump(count: &AtomicU32) {
+    count.store(
+        count.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+}
+
+/// Moves the count of `src`, a stage counter only the calling thread writes,
+/// onto `dst`, a ring counter, skipping both writes when it is zero.
 fn move_count(src: &AtomicU32, dst: &AtomicU32) {
-    let count = src.swap(0, Ordering::Relaxed);
+    let count = src.load(Ordering::Relaxed);
     if count != 0 {
+        src.store(0, Ordering::Relaxed);
         dst.fetch_add(count, Ordering::Relaxed);
     }
 }
@@ -246,8 +267,9 @@ pub(crate) struct SlidingWindow {
     origin: Instant,
     /// Seconds added to the tick; non-zero only when tests advance time.
     extra_secs: Arc<AtomicU64>,
-    /// One slot per second of the ring.
-    slots: [Slot; WINDOW_SECS as usize],
+    /// One slot per second of the ring, on the heap so that creating a window
+    /// never moves the 100 KiB ring by value.
+    slots: Box<[Slot]>,
     /// Stage of each thread index, allocated by the thread's first record.
     stages: [OnceLock<Box<Slot>>; MAX_STAGES],
 }
@@ -330,7 +352,7 @@ impl SlidingWindow {
         Self {
             origin,
             extra_secs,
-            slots: std::array::from_fn(|_| Slot::new()),
+            slots: (0..WINDOW_SECS).map(|_| Slot::new()).collect(),
             stages: std::array::from_fn(|_| OnceLock::new()),
         }
     }
@@ -402,7 +424,7 @@ impl SlidingWindow {
             }
             self.advance_stage(stage, current, tick);
         }
-        stage.add(bucket, class);
+        stage.add_owned(bucket, class);
     }
 
     /// Records one request in the ring slot of `tick`.
@@ -430,6 +452,8 @@ impl SlidingWindow {
     /// adding to the stage while it is drained. A second already outside the
     /// window is discarded instead of moved. Nothing in here can panic, which
     /// is what keeps the stage from being left in `TICK_RESETTING`.
+    #[cold]
+    #[inline(never)]
     fn advance_stage(&self, stage: &Slot, current: u64, tick: u64) {
         stage.tick.store(TICK_RESETTING, Ordering::Relaxed);
         // Pairs with the acquire fence in `Slot::read`: a snapshot that observes
@@ -509,7 +533,8 @@ impl SlidingWindow {
     }
 
     /// Reads every stage holding a second of the window ending at `tick` into
-    /// `staged`, recording the tick of each stage read into `observed`.
+    /// `staged`, one entry per distinct second, recording the tick of each stage
+    /// read into `observed`.
     ///
     /// Returns `false` when a stage was being moved and was skipped, so that the
     /// caller tries again once the move is over. Only stages that contributed
@@ -525,6 +550,7 @@ impl SlidingWindow {
         staged.clear();
         observed.fill(TICK_EMPTY);
         let mut stable = true;
+        let mut scratch = LatencyHist::default();
         for (index, cell) in self.stages.iter().enumerate().take(live_indices()) {
             let Some(stage) = cell.get() else {
                 continue;
@@ -540,17 +566,12 @@ impl SlidingWindow {
             if stage_tick > tick || tick - stage_tick >= WINDOW_SECS {
                 continue;
             }
-            let mut entry = Staged {
-                tick: stage_tick,
-                requests: 0,
-                status: [0; 5],
-                hist: LatencyHist::default(),
-            };
-            match stage.read(stage_tick, &mut entry.hist) {
+            match stage.read(stage_tick, &mut scratch) {
                 Some((requests, status)) if requests != 0 => {
-                    entry.requests = requests;
-                    entry.status = status;
-                    staged.push(entry);
+                    let entry = staged_second(staged, stage_tick);
+                    entry.requests += requests;
+                    add_status(&mut entry.status, status);
+                    entry.hist.add_from(&scratch);
                     observed[index] = stage_tick;
                 }
                 Some(_) => {}
@@ -764,6 +785,24 @@ fn back_off(attempt: usize) {
     } else {
         std::thread::sleep(FOLD_LONG_PAUSE);
     }
+}
+
+/// Returns the entry of `staged` for the second `tick`, adding an empty one when
+/// the second has no entry yet.
+fn staged_second(staged: &mut Vec<Staged>, tick: u64) -> &mut Staged {
+    let at = match staged.iter().position(|entry| entry.tick == tick) {
+        Some(at) => at,
+        None => {
+            staged.push(Staged {
+                tick,
+                requests: 0,
+                status: [0; 5],
+                hist: LatencyHist::default(),
+            });
+            staged.len() - 1
+        }
+    };
+    &mut staged[at]
 }
 
 /// Builds the aggregate of a `window`-second window ending at `tick`.
@@ -1253,7 +1292,11 @@ mod tests {
     fn slot_layout_matches_the_crate_docs() {
         assert_eq!(std::mem::size_of::<Slot>(), 1_152);
         assert_eq!(std::mem::align_of::<Slot>(), 128);
-        // A ring: 90 slots plus the stage cells, about 102 KiB.
-        assert!(std::mem::size_of::<SlidingWindow>() <= 105 * 1024);
+        // A ring: 90 slots on the heap plus the window with its stage cells,
+        // about 102 KiB in all.
+        let ring = WINDOW_SECS as usize * std::mem::size_of::<Slot>()
+            + std::mem::size_of::<SlidingWindow>();
+        assert!(ring <= 105 * 1024);
+        assert!(std::mem::size_of::<SlidingWindow>() <= 2 * 1024);
     }
 }
